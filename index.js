@@ -43,120 +43,143 @@ function getLitecoinAddress(index) {
   const child = root.derivePath(`m/44'/2'/0'/0/${safeIndex}`);
   const pubkey = Buffer.from(child.publicKey);
   
+  // Generate all possible address formats
   const legacy = bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
-  const segwit = bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN }), network: LITECOIN });
+  const segwitP2sh = bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN }), network: LITECOIN });
   const nativeSegwit = bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN });
   
   const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
   
+  // Also generate capitalized versions of Bech32 (some wallets use Lc1... or LTC1...)
+  const nativeSegwitUpper = nativeSegwit.address ? nativeSegwit.address.toUpperCase().replace('LTC1', 'Lc1') : null;
+  
   return { 
-    address: legacy.address,
-    segwitAddress: segwit.address,
-    nativeSegwitAddress: nativeSegwit.address,
+    legacy: legacy.address,           // L... (P2PKH)
+    segwitP2sh: segwitP2sh.address,     // M... (P2SH-P2WPKH)
+    nativeSegwit: nativeSegwit.address, // ltc1... (P2WPKH Bech32)
+    nativeSegwitUpper: nativeSegwitUpper, // Lc1... (Capitalized Bech32)
     privateKey: keyPair.toWIF(), 
     index: safeIndex,
     publicKey: pubkey.toString('hex')
   };
 }
 
-async function getAddressState(address) {
+async function checkAddressBalance(address) {
   try {
-    let url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
-    let { data } = await axios.get(url, { timeout: 10000 });
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`;
+    const { data } = await axios.get(url, { timeout: 10000 });
     
-    if (!data?.data?.[address]) {
-      console.log(`[API] No data for ${address}, trying to find correct format...`);
+    if (data?.data?.[address]) {
+      const addr = data.data[address].address;
+      const balance = (addr.balance || 0) / 100000000;
+      const received = (addr.received || 0) / 100000000;
+      const spent = (addr.spent || 0) / 100000000;
+      const unconfirmed = Math.max(0, received - spent - balance);
       
-      for (let i = 0; i <= 9; i++) {
-        const wallet = getLitecoinAddress(i);
-        if (wallet.address === address || wallet.segwitAddress === address || wallet.nativeSegwitAddress === address) {
-          const formats = [wallet.address, wallet.segwitAddress, wallet.nativeSegwitAddress];
-          for (const fmt of formats) {
-            if (!fmt) continue;
-            try {
-              url = `https://api.blockchair.com/litecoin/dashboards/address/${fmt}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
-              const test = await axios.get(url, { timeout: 10000 });
-              if (test?.data?.data?.[fmt]) {
-                console.log(`[API] Found balance on format: ${fmt}`);
-                data = test.data;
-                address = fmt;
-                break;
-              }
-            } catch (e) {}
-          }
-          break;
-        }
-      }
+      const utxos = (data.data[address].utxo || []).map(u => ({
+        txid: u.transaction_hash,
+        vout: u.index,
+        value: parseInt(u.value),
+        script: u.script_hex
+      }));
+      
+      return { 
+        success: true, 
+        confirmed: balance, 
+        unconfirmed: unconfirmed,
+        total: balance + unconfirmed,
+        utxos: utxos,
+        address: address,
+        raw: data.data[address]
+      };
     }
-    
-    if (!data?.data?.[address]) {
-      console.log(`[API] No data found for any format of ${address}`);
-      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [], address: address };
-    }
-    
-    const addr = data.data[address].address;
-    const confirmed = (addr.balance || 0) / 100000000;
-    const received = (addr.received || 0) / 100000000;
-    const spent = (addr.spent || 0) / 100000000;
-    const unconfirmed = Math.max(0, received - spent - confirmed);
-    
-    const utxos = [];
-    if (data.data[address].utxo && Array.isArray(data.data[address].utxo)) {
-      for (const u of data.data[address].utxo) {
-        if (u.value > 0) {
-          utxos.push({
-            txid: u.transaction_hash,
-            vout: u.index,
-            value: parseInt(u.value),
-            script: u.script_hex,
-            address: address
-          });
-        }
-      }
-    }
-    
-    console.log(`[BALANCE] ${address}: ${confirmed.toFixed(8)} LTC confirmed, ${utxos.length} UTXOs`);
-    
-    return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos, address };
+    return { success: false, total: 0, utxos: [] };
   } catch (error) {
-    console.error(`[API ERROR] ${address}: ${error.message}`);
-    return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [], address };
+    console.log(`[CHECK ERROR] ${address}: ${error.message}`);
+    return { success: false, total: 0, utxos: [] };
   }
+}
+
+async function getAddressState(addressOrIndex) {
+  // If number passed, get all formats for that index
+  if (typeof addressOrIndex === 'number') {
+    const wallet = getLitecoinAddress(addressOrIndex);
+    
+    console.log(`[INDEX ${addressOrIndex}] Checking all formats:`);
+    console.log(`  Legacy: ${wallet.legacy}`);
+    console.log(`  SegWit P2SH: ${wallet.segwitP2sh}`);
+    console.log(`  Native SegWit: ${wallet.nativeSegwit}`);
+    console.log(`  Native SegWit Upper: ${wallet.nativeSegwitUpper}`);
+    
+    // Check ALL formats and return the one with highest balance
+    const checks = await Promise.all([
+      checkAddressBalance(wallet.legacy),
+      checkAddressBalance(wallet.segwitP2sh),
+      checkAddressBalance(wallet.nativeSegwit),
+      wallet.nativeSegwitUpper ? checkAddressBalance(wallet.nativeSegwitUpper) : { success: false, total: 0 }
+    ]);
+    
+    // Also try lowercase version of capitalized address if provided
+    let targetAddress = null;
+    let bestBalance = 0;
+    let bestResult = null;
+    
+    for (let i = 0; i < checks.length; i++) {
+      const check = checks[i];
+      const format = ['legacy', 'segwitP2sh', 'nativeSegwit', 'nativeSegwitUpper'][i];
+      console.log(`  ${format}: ${check.total.toFixed(8)} LTC`);
+      
+      if (check.total > bestBalance) {
+        bestBalance = check.total;
+        bestResult = check;
+        targetAddress = check.address;
+      }
+    }
+    
+    if (bestResult && bestBalance > 0) {
+      console.log(`[FOUND] Best format: ${targetAddress} with ${bestBalance.toFixed(8)} LTC`);
+      return {
+        confirmed: bestResult.confirmed,
+        unconfirmed: bestResult.unconfirmed,
+        total: bestResult.total,
+        utxos: bestResult.utxos,
+        address: targetAddress,
+        wallet: wallet
+      };
+    }
+    
+    // Return default (legacy) if no balance found
+    return {
+      confirmed: 0,
+      unconfirmed: 0,
+      total: 0,
+      utxos: [],
+      address: wallet.legacy,
+      wallet: wallet
+    };
+  }
+  
+  // If specific address passed, check it directly
+  return await checkAddressBalance(addressOrIndex);
 }
 
 async function sendAllLTC(fromIndex, toAddress) {
   try {
     const safeIndex = Math.max(0, Math.min(9, parseInt(fromIndex) || 0));
-    const wallet = getLitecoinAddress(safeIndex);
+    const state = await getAddressState(safeIndex);
     
-    const formats = [
-      { address: wallet.address, type: 'legacy' },
-      { address: wallet.segwitAddress, type: 'segwit' },
-      { address: wallet.nativeSegwitAddress, type: 'native' }
-    ];
-    
-    let totalState = { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
-    let usedFormat = null;
-    
-    for (const fmt of formats) {
-      if (!fmt.address) continue;
-      const state = await getAddressState(fmt.address);
-      if (state.total > totalState.total) {
-        totalState = state;
-        usedFormat = fmt;
-      }
+    if (state.total <= 0.0001) {
+      return { success: false, error: `No balance on index ${safeIndex}. Checked all formats.` };
     }
     
-    console.log(`[SEND] Index ${safeIndex}: Best format ${usedFormat?.type} (${usedFormat?.address}) with ${totalState.total.toFixed(8)} LTC`);
-    
-    if (totalState.total <= 0.0001) return { success: false, error: 'No balance on any address format' };
-    if (totalState.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
+    if (state.utxos.length === 0) {
+      return { success: false, error: 'No UTXOs available' };
+    }
     
     const psbt = new bitcoin.Psbt({ network: LITECOIN });
     let totalInput = 0;
-    let addedInputs = 0;
     
-    for (const utxo of totalState.utxos) {
+    for (const utxo of state.utxos) {
       try {
         const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}?key=${BLOCKCHAIR_KEY}`;
         const { data } = await axios.get(txUrl, { timeout: 10000 });
@@ -164,45 +187,40 @@ async function sendAllLTC(fromIndex, toAddress) {
         if (data?.data?.[utxo.txid]?.raw_transaction) {
           const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
           
-          const inputData = {
+          psbt.addInput({
             hash: utxo.txid,
             index: utxo.vout,
             nonWitnessUtxo: rawTx
-          };
+          });
           
-          if (usedFormat.type !== 'legacy') {
-            inputData.witnessUtxo = {
-              script: Buffer.from(utxo.script, 'hex'),
-              value: utxo.value
-            };
-          }
-          
-          psbt.addInput(inputData);
           totalInput += utxo.value;
-          addedInputs++;
         }
       } catch (e) {
-        console.log(`[SEND] Failed to add input ${utxo.txid}: ${e.message}`);
-        continue;
+        console.log(`[SEND] Failed to add input: ${e.message}`);
       }
     }
     
-    if (addedInputs === 0) return { success: false, error: 'No spendable inputs found' };
+    if (totalInput === 0) {
+      return { success: false, error: 'Could not add any inputs' };
+    }
     
-    const fee = 100000;
+    const fee = 100000; // 0.001 LTC
     const amount = totalInput - fee;
     
-    if (amount <= 0) return { success: false, error: `Amount too small for fee` };
+    if (amount <= 0) {
+      return { success: false, error: 'Balance too small for fee' };
+    }
     
     psbt.addOutput({ address: toAddress, value: amount });
     
+    const wallet = getLitecoinAddress(safeIndex);
     const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
     
     for (let i = 0; i < psbt.inputCount; i++) {
       try {
         psbt.signInput(i, keyPair);
       } catch (e) {
-        console.log(`[SEND] Failed to sign input ${i}: ${e.message}`);
+        console.log(`[SEND] Sign error input ${i}: ${e.message}`);
       }
     }
     
@@ -216,12 +234,12 @@ async function sendAllLTC(fromIndex, toAddress) {
     );
     
     if (broadcast.data?.data?.transaction_hash) {
-      return { 
-        success: true, 
-        txid: broadcast.data.data.transaction_hash, 
-        amount: amount / 100000000, 
+      return {
+        success: true,
+        txid: broadcast.data.data.transaction_hash,
+        amount: amount / 100000000,
         fee: fee / 100000000,
-        fromAddress: usedFormat.address
+        fromAddress: state.address
       };
     } else {
       return { success: false, error: 'Broadcast failed', details: broadcast.data };
@@ -293,16 +311,19 @@ client.on('interactionCreate', async (interaction) => {
     
     const wallet = getLitecoinAddress(idx);
     
-    const legacyState = await getAddressState(wallet.address);
-    const segwitState = await getAddressState(wallet.segwitAddress);
-    const nativeState = await getAddressState(wallet.nativeSegwitAddress);
+    // Check all formats
+    const legacyCheck = await checkAddressBalance(wallet.legacy);
+    const segwitCheck = await checkAddressBalance(wallet.segwitP2sh);
+    const nativeCheck = await checkAddressBalance(wallet.nativeSegwit);
+    const nativeUpperCheck = wallet.nativeSegwitUpper ? await checkAddressBalance(wallet.nativeSegwitUpper) : { total: 0 };
     
     const embed = new EmbedBuilder()
       .setTitle(`🔍 Debug Wallet ${idx}`)
       .addFields(
-        { name: 'Legacy (L...)', value: `\`${wallet.address}\`\nBalance: ${legacyState.total.toFixed(8)} LTC`, inline: false },
-        { name: 'SegWit (M...)', value: `\`${wallet.segwitAddress}\`\nBalance: ${segwitState.total.toFixed(8)} LTC`, inline: false },
-        { name: 'Native SegWit (ltc1...)', value: `\`${wallet.nativeSegwitAddress}\`\nBalance: ${nativeState.total.toFixed(8)} LTC`, inline: false }
+        { name: `Legacy (L...) - ${legacyCheck.total.toFixed(8)} LTC`, value: `\`${wallet.legacy}\``, inline: false },
+        { name: `SegWit P2SH (M...) - ${segwitCheck.total.toFixed(8)} LTC`, value: `\`${wallet.segwitP2sh}\``, inline: false },
+        { name: `Native SegWit (ltc1...) - ${nativeCheck.total.toFixed(8)} LTC`, value: `\`${wallet.nativeSegwit}\``, inline: false },
+        { name: `Native SegWit Upper (Lc1...) - ${nativeUpperCheck.total.toFixed(8)} LTC`, value: `\`${wallet.nativeSegwitUpper || 'N/A'}\``, inline: false }
       )
       .setColor(0x00FF00);
     
@@ -334,53 +355,46 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const address = interaction.options.getString('address');
     
-    const results = [];
+    let results = [];
     for (let i = 0; i <= 9; i++) {
       const result = await sendAllLTC(i, address);
-      if (result.success || result.balance > 0) {
-        results.push({ index: i, ...result });
+      if (result.success) {
+        results.push(`✅ Index ${i}: Sent ${result.amount.toFixed(8)} LTC from ${result.fromAddress.slice(0,15)}...`);
       }
     }
     
-    let text = `**Sweep Results:**\n`;
-    for (const r of results) {
-      if (r.success) {
-        text += `✅ Index ${r.index} (${r.fromAddress?.slice(0,10)}...): Sent ${r.amount?.toFixed(8)} LTC\n`;
-      } else if (r.balance > 0) {
-        text += `⚠️ Index ${r.index}: ${r.balance.toFixed(8)} LTC but failed to send (${r.error})\n`;
+    if (results.length === 0) {
+      // Try to show which indices have balance
+      let debugInfo = [];
+      for (let i = 0; i <= 9; i++) {
+        const state = await getAddressState(i);
+        if (state.total > 0) {
+          debugInfo.push(`Index ${i}: ${state.total.toFixed(8)} LTC at ${state.address.slice(0,15)}...`);
+        }
       }
+      
+      let msg = '❌ No funds sent. ';
+      if (debugInfo.length > 0) {
+        msg += `Found balance but failed to send:\n${debugInfo.join('\n')}`;
+      } else {
+        msg += 'No balance found on any index (0-9) in any format.';
+      }
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.editReply({ content: results.join('\n') });
     }
-    if (results.length === 0) text += 'No balances found on indices 0-9';
-    await interaction.editReply({ content: text });
   }
   else if (interaction.commandName === 'balance') {
     const idx = interaction.options.getInteger('index');
     if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index 0-9 only', flags: MessageFlags.Ephemeral });
     
-    const wallet = getLitecoinAddress(idx);
-    
-    const formats = [
-      { name: 'Legacy', addr: wallet.address },
-      { name: 'SegWit', addr: wallet.segwitAddress },
-      { name: 'Native', addr: wallet.nativeSegwitAddress }
-    ];
-    
-    let bestState = null;
-    let bestFormat = null;
-    
-    for (const fmt of formats) {
-      const state = await getAddressState(fmt.addr);
-      if (!bestState || state.total > bestState.total) {
-        bestState = state;
-        bestFormat = fmt;
-      }
-    }
+    const state = await getAddressState(idx);
     
     await interaction.reply({
       embeds: [new EmbedBuilder()
-        .setTitle(`💰 Wallet ${idx} (${bestFormat.name})`)
-        .setDescription(`Address: \`${bestFormat.addr}\`\nConfirmed: ${bestState.confirmed.toFixed(8)} LTC\nUnconfirmed: ${bestState.unconfirmed.toFixed(8)} LTC\n**Total: ${bestState.total.toFixed(8)} LTC**`)
-        .setColor(bestState.total > 0 ? 0x00FF00 : 0xFF0000)
+        .setTitle(`💰 Wallet ${idx}`)
+        .setDescription(`**Active Address:** \`${state.address}\`\nConfirmed: ${state.confirmed.toFixed(8)} LTC\nUnconfirmed: ${state.unconfirmed.toFixed(8)} LTC\n**Total: ${state.total.toFixed(8)} LTC**`)
+        .setColor(state.total > 0 ? 0x00FF00 : 0xFF0000)
       ],
       flags: MessageFlags.Ephemeral
     });
@@ -390,17 +404,22 @@ client.on('interactionCreate', async (interaction) => {
     if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
     await interaction.deferReply();
+    const state = await getAddressState(ticket.walletIndex);
     
-    const state = await getAddressState(ticket.address);
-    
-    let text = `**Payment Check**\nAddress: \`${ticket.address}\`\nExpected: ${ticket.amountLtc} LTC\nDetected: ${state.total.toFixed(8)} LTC\n\n`;
+    let text = `**Payment Check for Index ${ticket.walletIndex}**\n`;
+    text += `Checking address: ${state.address}\n`;
+    text += `Expected: ${ticket.amountLtc} LTC\n`;
+    text += `Detected: ${state.total.toFixed(8)} LTC\n\n`;
     
     if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
       text += `✅ **PAYMENT DETECTED!**`;
       await interaction.editReply({ content: text });
       await processPayment(interaction.channel.id, state.total);
+    } else if (state.total > 0) {
+      text += `⚠️ Payment outside tolerance. Min: ${ticket.minLtc}, Max: ${ticket.maxLtc}`;
+      await interaction.editReply({ content: text });
     } else {
-      text += `❌ Waiting for payment...`;
+      text += `❌ No payment detected`;
       await interaction.editReply({ content: text });
     }
   }
@@ -409,10 +428,10 @@ client.on('interactionCreate', async (interaction) => {
     if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
     await interaction.reply({ content: '🔄 Forcing...', flags: MessageFlags.Ephemeral });
-    await processPayment(interaction.channel.id, ticket.amountLtc || 0.01);
+    const state = await getAddressState(ticket.walletIndex);
+    await processPayment(interaction.channel.id, state.total > 0 ? state.total : (ticket.amountLtc || 0.01));
   }
   else if (interaction.commandName === 'close') {
-    const ticket = tickets.get(interaction.channel.id);
     tickets.delete(interaction.channel.id);
     await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
@@ -442,13 +461,9 @@ client.on('interactionCreate', async (interaction) => {
     
     if (addressIndex > 9) addressIndex = 0;
     
-    const wallet = getLitecoinAddress(addressIndex);
-    
-    const legacyState = await getAddressState(wallet.address);
-    const segwitState = await getAddressState(wallet.segwitAddress);
-    
-    let useAddress = wallet.address;
-    if (segwitState.total > legacyState.total) useAddress = wallet.segwitAddress;
+    // Get the address with highest balance for this index, or default to legacy
+    const state = await getAddressState(addressIndex);
+    const useAddress = state.address;
     
     const channel = await interaction.guild.channels.create({
       name: `nitro-${interaction.user.username}`,
@@ -484,12 +499,21 @@ client.on('interactionCreate', async (interaction) => {
       userId: interaction.user.id, 
       status: 'selecting', 
       channelId: channel.id,
-      walletIndex: addressIndex,
+      walletIndex: addressIndex,  // Store index, not address
       address: useAddress,
-      privateKey: wallet.privateKey
+      product: null,
+      productName: null,
+      price: null,
+      quantity: null,
+      amountUsd: null,
+      amountLtc: null,
+      minLtc: null,
+      maxLtc: null,
+      paid: false,
+      delivered: false
     });
     
-    console.log(`[TICKET] ${channel.id} index ${addressIndex}, address: ${useAddress}`);
+    console.log(`[TICKET] ${channel.id} -> Index ${addressIndex}, Address: ${useAddress}`);
     addressIndex++;
     if (addressIndex > 9) addressIndex = 0;
     
@@ -615,8 +639,9 @@ async function monitorMempool() {
   
   for (const [channelId, ticket] of awaiting) {
     try {
-      const state = await getAddressState(ticket.address);
-      console.log(`[MONITOR] ${ticket.address}: ${state.total.toFixed(8)} LTC`);
+      // Use index to check all formats
+      const state = await getAddressState(ticket.walletIndex);
+      console.log(`[MONITOR] Index ${ticket.walletIndex} (${state.address.slice(0,10)}...): ${state.total.toFixed(8)} LTC`);
       
       if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
         console.log(`[MONITOR] ✅ PAYMENT DETECTED`);
