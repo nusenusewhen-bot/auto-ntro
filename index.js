@@ -42,19 +42,52 @@ function getLitecoinAddress(index) {
   return { address, privateKey: keyPair.toWIF(), index };
 }
 
-async function getAddressState(address) {
+async function getAddressBalance(address) {
   try {
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`;
-    const { data } = await axios.get(url, { timeout: 10000 });
+    console.log(`[API] Checking balance for ${address}`);
+    const { data } = await axios.get(url, { timeout: 15000 });
+    
+    if (!data?.data?.[address]) {
+      console.log(`[API] No data returned for address`);
+      return { balance: 0, received: 0, unconfirmed: 0, txs: [] };
+    }
+    
+    const addrData = data.data[address].address;
+    const balance = addrData.balance / 100000000;
+    const received = addrData.received / 100000000;
+    const spent = addrData.spent / 100000000;
+    const unconfirmed = Math.max(0, received - spent - balance);
+    const txs = data.data[address].transactions || [];
+    
+    console.log(`[API] Address ${address}: Balance=${balance} LTC, Received=${received} LTC, Unconfirmed=${unconfirmed} LTC, Txs=${txs.length}`);
+    
+    return { balance, received, unconfirmed, txs };
+  } catch (e) {
+    console.error(`[API ERROR] ${e.message}`);
+    return { balance: 0, received: 0, unconfirmed: 0, txs: [] };
+  }
+}
+
+async function getAddressState(address) {
+  try {
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
+    const { data } = await axios.get(url, { timeout: 15000 });
+    
     if (!data?.data?.[address]) return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
+    
     const addr = data.data[address].address;
     const confirmed = addr.balance / 100000000;
     const received = addr.received / 100000000;
     const spent = addr.spent / 100000000;
     const unconfirmed = Math.max(0, received - spent - confirmed);
     const utxos = (data.data[address].utxo || []).map(u => ({ txid: u.transaction_hash, vout: u.index, value: u.value, script: u.script_hex }));
+    
     return { confirmed, unconfirmed, total: confirmed + unconfirmed, utxos };
-  } catch { return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] }; }
+  } catch (e) {
+    console.error(`[STATE ERROR] ${e.message}`);
+    return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
+  }
 }
 
 async function sendAllLTC(fromIndex, toAddress) {
@@ -132,11 +165,13 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
     new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
     new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
+    new SlashCommandBuilder().setName('checkpayment').setDescription('Manually check payment for this ticket (Owner)'),
     new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)')
   ];
   
   await client.application.commands.set(commands);
   setInterval(checkPayments, 5000);
+  console.log('[SYSTEM] Payment checker started (every 5s)');
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -181,6 +216,35 @@ client.on('interactionCreate', async (interaction) => {
     }
     await interaction.editReply({ content: text });
   }
+  else if (interaction.commandName === 'checkpayment') {
+    const ticket = tickets.get(interaction.channel.id);
+    if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
+    if (!ticket.address) return interaction.reply({ content: '❌ No payment address', flags: MessageFlags.Ephemeral });
+    
+    await interaction.deferReply();
+    const balance = await getAddressBalance(ticket.address);
+    
+    const expectedLtc = ticket.amountLtc;
+    const tolerance = TOLERANCE_USD / ltcPrice;
+    const minExpected = parseFloat(expectedLtc) - tolerance;
+    const maxExpected = parseFloat(expectedLtc) + tolerance + 0.001;
+    
+    let status = `**Expected:** ${expectedLtc} LTC ($${ticket.amountUsd})\n`;
+    status += `**Received:** ${balance.balance} LTC (confirmed) + ${balance.unconfirmed} LTC (unconfirmed) = ${balance.balance + balance.unconfirmed} LTC total\n`;
+    status += `**Tolerance:** ±${tolerance.toFixed(8)} LTC (±$0.10)\n`;
+    status += `**Range:** ${minExpected.toFixed(8)} - ${maxExpected.toFixed(8)} LTC\n`;
+    
+    const totalReceived = balance.balance + balance.unconfirmed;
+    if (totalReceived >= minExpected && totalReceived <= maxExpected) {
+      status += `\n✅ **PAYMENT DETECTED WITHIN TOLERANCE!**`;
+    } else if (totalReceived > 0) {
+      status += `\n⚠️ **Payment received but outside tolerance range**`;
+    } else {
+      status += `\n❌ **No payment detected yet**`;
+    }
+    
+    await interaction.editReply({ content: status });
+  }
   else if (interaction.commandName === 'close') {
     const ticket = tickets.get(interaction.channel.id);
     if (ticket && settings.transcriptChannel) {
@@ -188,9 +252,7 @@ client.on('interactionCreate', async (interaction) => {
       if (ch) ch.send({ embeds: [new EmbedBuilder().setTitle('Ticket Closed').addFields({name:'User',value:`<@${ticket.userId}>`},{name:'Product',value:ticket.productName||'N/A'}).setTimestamp()] });
     }
     
-    // DELETE TICKET FROM MAP BEFORE CLOSING CHANNEL
     tickets.delete(interaction.channel.id);
-    
     await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
   }
@@ -205,16 +267,13 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
     if (!settings.ticketCategory) return interaction.reply({ content: '❌ Not setup', flags: MessageFlags.Ephemeral });
     
-    // CHECK IF CHANNEL ACTUALLY EXISTS - not just if ticket is in map
     const existingTicket = Array.from(tickets.entries()).find(([_, t]) => t.userId === interaction.user.id && t.status !== 'delivered');
     if (existingTicket) {
       const [channelId, ticketData] = existingTicket;
-      // Check if channel still exists
       const existingChannel = interaction.guild.channels.cache.get(channelId);
       if (existingChannel) {
         return interaction.reply({ content: `❌ You already have an open ticket: ${existingChannel}`, flags: MessageFlags.Ephemeral });
       } else {
-        // Channel was deleted but ticket still in map - clean it up
         tickets.delete(channelId);
       }
     }
@@ -270,46 +329,71 @@ client.on('interactionCreate', async (interaction) => {
     ticket.address = wallet.address;
     ticket.walletIndex = wallet.index;
     ticket.amountUsd = totalUsd;
-    ticket.minLtc = parseFloat(totalLtc) - (TOLERANCE_USD / ltcPrice);
-    ticket.maxLtc = parseFloat(totalLtc) + (TOLERANCE_USD / ltcPrice) + 0.001;
+    ticket.amountLtc = totalLtc;
+    
+    const toleranceLtc = TOLERANCE_USD / ltcPrice;
+    ticket.minLtc = parseFloat(totalLtc) - toleranceLtc;
+    ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc + 0.001;
     ticket.status = 'awaiting_payment';
     
-    await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💳 Payment').setDescription(`**${ticket.productName}** x${qty}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`).addFields({name:'📋 LTC Address',value:`\`${wallet.address}\``},{name:'💰 Amount (±$0.10 OK)',value:`\`${totalLtc} LTC\``}).setColor(0xFFD700)] });
+    console.log(`[TICKET] Created payment request: ${wallet.address} | Expected: ${totalLtc} LTC | Range: ${ticket.minLtc.toFixed(8)} - ${ticket.maxLtc.toFixed(8)} LTC`);
+    
+    await interaction.reply({ embeds: [new EmbedBuilder().setTitle('💳 Payment').setDescription(`**${ticket.productName}** x${qty}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`).addFields({name:'📋 LTC Address',value:`\`${wallet.address}\``},{name:'💰 Amount (±$0.10 OK)',value:`\`${totalLtc} LTC\``},{name:'⚡ Status',value:'Waiting for payment...'}).setColor(0xFFD700)] });
   }
 });
 
 async function checkPayments() {
   const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment');
   
+  if (awaiting.length > 0) {
+    console.log(`[CHECK] Checking ${awaiting.length} awaiting tickets...`);
+  }
+  
   for (const [channelId, ticket] of awaiting) {
-    // Check if channel still exists before processing
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel) {
-      tickets.delete(channelId); // Clean up orphaned tickets
+      tickets.delete(channelId);
       continue;
     }
     
-    const state = await getAddressState(ticket.address);
+    console.log(`[CHECK] Checking address ${ticket.address} | Expected: ${ticket.minLtc.toFixed(8)} - ${ticket.maxLtc.toFixed(8)} LTC`);
     
-    if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
+    const balance = await getAddressBalance(ticket.address);
+    const totalReceived = balance.balance + balance.unconfirmed;
+    
+    console.log(`[CHECK] Received: ${totalReceived.toFixed(8)} LTC (confirmed: ${balance.balance}, unconfirmed: ${balance.unconfirmed})`);
+    
+    // Check if payment is within tolerance (includes unconfirmed/mempool)
+    if (totalReceived >= ticket.minLtc && totalReceived <= ticket.maxLtc) {
+      console.log(`[CHECK] ✅ PAYMENT DETECTED! Processing...`);
+      
       ticket.status = 'delivered';
       
-      await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
+      // Send to owner
+      const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
+      console.log(`[AUTO-SEND] Result: ${sendResult.success ? 'Success' : 'Failed - ' + sendResult.error}`);
       
-      await channel.send({ embeds: [new EmbedBuilder().setTitle('⏳ Wait For Owner Arrival').setDescription(`Payment: ${state.total.toFixed(8)} LTC\nPlease wait for owner.`).setColor(0xFFA500)] });
+      await channel.send({ embeds: [new EmbedBuilder().setTitle('⏳ Wait For Owner Arrival').setDescription(`Payment detected: ${totalReceived.toFixed(8)} LTC\nStatus: **Pending Owner Review**\n\nPlease wait while the owner processes your order.`).setColor(0xFFA500)] });
       
+      // Notify owner
       const owner = await client.users.fetch(OWNER_ID).catch(() => null);
-      if (owner) owner.send({ content: `New order: ${ticket.productName} x${ticket.quantity} - $${ticket.amountUsd} - <#${channelId}>` });
+      if (owner) {
+        owner.send({ content: `🛒 **New Nitro Order**\nProduct: ${ticket.productName}\nQuantity: ${ticket.quantity}\nAmount: $${ticket.amountUsd.toFixed(2)}\nReceived: ${totalReceived.toFixed(8)} LTC\nChannel: <#${channelId}>` });
+      }
       
+      // Deliver products
       const links = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
       links.forEach(l => usedStock.add(l));
       
-      await channel.send({ embeds: [new EmbedBuilder().setTitle('🎁 Your Nitro').setDescription(links.map((l,i) => `Link ${i+1}: ${l}`).join('\n')).setColor(0x00FF00)] });
+      await channel.send({ embeds: [new EmbedBuilder().setTitle('🎁 Your Nitro Links').setDescription(links.map((l,i) => `**Link ${i+1}:** ${l}`).join('\n')).setColor(0x00FF00)] });
       
+      // Sale log
       if (settings.saleChannel) {
         const ch = client.channels.cache.get(settings.saleChannel);
-        if (ch) ch.send({ embeds: [new EmbedBuilder().setTitle('💰 Sale').setDescription(`${ticket.productName} x${ticket.quantity} - $${ticket.amountUsd}`).setColor(0x00FF00)] });
+        if (ch) ch.send({ embeds: [new EmbedBuilder().setTitle('💰 New Sale').setDescription(`${ticket.productName} x${ticket.quantity}\nAmount: $${ticket.amountUsd.toFixed(2)}`).setColor(0x00FF00).setTimestamp()] });
       }
+    } else if (totalReceived > 0) {
+      console.log(`[CHECK] Payment received (${totalReceived.toFixed(8)} LTC) but outside tolerance range (${ticket.minLtc.toFixed(8)} - ${ticket.maxLtc.toFixed(8)})`);
     }
   }
 }
