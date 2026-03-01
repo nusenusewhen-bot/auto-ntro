@@ -101,7 +101,7 @@ async function getAddressBalance(address) {
 async function sendAllLTC(fromIndex, toAddress) {
   try {
     const wallet = getLitecoinAddress(fromIndex);
-    console.log(`[SEND] Index ${fromIndex} → ${toAddress}`);
+    console.log(`[SEND] Index ${fromIndex} to ${toAddress}`);
     
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${wallet.address}?key=${BLOCKCHAIR_KEY}`;
     const { data } = await axios.get(url, { timeout: 15000 });
@@ -124,7 +124,7 @@ async function sendAllLTC(fromIndex, toAddress) {
             index: utxo.index,
             nonWitnessUtxo: Buffer.from(txData.data.data[utxo.transaction_hash].raw_transaction, 'hex')
           });
-          totalInput += parseInt(uto.value);
+          totalInput += parseInt(utxo.value);
         }
       } catch (e) { continue; }
     }
@@ -160,7 +160,7 @@ async function sendAllLTC(fromIndex, toAddress) {
 }
 
 client.once('ready', async () => {
-  console.log(`(`✅ Bot logged in as ${client.user.tag}`);
+  console.log(`[READY] Bot logged in as ${client.user.tag}`);
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
@@ -421,7 +421,6 @@ client.on('interactionCreate', async (interaction) => {
       ] 
     });
     
-    // Immediate check
     setTimeout(async () => {
       const bal = await getAddressBalance(ticket.address);
       console.log(`[INIT] ${ticket.address}: ${bal.total} LTC`);
