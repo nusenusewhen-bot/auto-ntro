@@ -36,12 +36,15 @@ const PRODUCTS = {
 };
 
 function getLitecoinAddress(index) {
+  // STRICT: Only allow 0-9
+  const safeIndex = Math.max(0, Math.min(9, parseInt(index) || 0));
+  
   const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
   const root = bip32.fromSeed(seed, LITECOIN);
-  const child = root.derivePath(`m/44'/2'/0'/0/${index}`);
+  const child = root.derivePath(`m/44'/2'/0'/0/${safeIndex}`);
   const { address } = bitcoin.payments.p2pkh({ pubkey: Buffer.from(child.publicKey), network: LITECOIN });
   const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
-  return { address, privateKey: keyPair.toWIF(), index };
+  return { address, privateKey: keyPair.toWIF(), index: safeIndex };
 }
 
 async function getAddressState(address) {
@@ -49,82 +52,138 @@ async function getAddressState(address) {
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
     const { data } = await axios.get(url, { timeout: 10000 });
     
-    if (!data?.data?.[address]) return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+    if (!data?.data?.[address]) {
+      console.log(`[API] No data for ${address}`);
+      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+    }
     
     const addr = data.data[address].address;
-    const confirmed = addr.balance / 100000000;
-    const received = addr.received / 100000000;
-    const spent = addr.spent / 100000000;
+    // Blockchair returns values in satoshis, convert to LTC (1 LTC = 100,000,000 satoshis)
+    const confirmed = (addr.balance || 0) / 100000000;
+    const received = (addr.received || 0) / 100000000;
+    const spent = (addr.spent || 0) / 100000000;
     const unconfirmed = Math.max(0, received - spent - confirmed);
     
-    const utxos = (data.data[address].utxo || []).map(u => ({
-      txid: u.transaction_hash,
-      vout: u.index,
-      value: u.value,
-      script: u.script_hex
-    }));
+    // FIX: Properly extract UTXOs with correct value conversion
+    const utxos = [];
+    if (data.data[address].utxo && Array.isArray(data.data[address].utxo)) {
+      for (const u of data.data[address].utxo) {
+        if (u.value > 0) {
+          utxos.push({
+            txid: u.transaction_hash,
+            vout: u.index,
+            value: parseInt(u.value), // Keep in satoshis for transaction building
+            script: u.script_hex
+          });
+        }
+      }
+    }
+    
+    console.log(`[BALANCE] ${address}: ${confirmed.toFixed(8)} LTC confirmed, ${utxos.length} UTXOs`);
     
     return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos };
   } catch (error) {
-    console.error(`[API ERROR] ${error.message}`);
+    console.error(`[API ERROR] ${address}: ${error.message}`);
     return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
   }
 }
 
 async function sendAllLTC(fromIndex, toAddress) {
   try {
-    const wallet = getLitecoinAddress(fromIndex);
+    // STRICT: Only allow 0-9
+    const safeIndex = Math.max(0, Math.min(9, parseInt(fromIndex) || 0));
+    const wallet = getLitecoinAddress(safeIndex);
     const state = await getAddressState(wallet.address);
     
-    if (state.confirmed <= 0) return { success: false, error: 'No confirmed balance' };
+    console.log(`[SEND] Index ${safeIndex}: ${state.confirmed.toFixed(8)} LTC, ${state.utxos.length} UTXOs`);
+    
+    if (state.confirmed <= 0.0001) return { success: false, error: 'No confirmed balance' };
     if (state.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
     
     const psbt = new bitcoin.Psbt({ network: LITECOIN });
     let totalInput = 0;
+    let addedInputs = 0;
     
+    // FIX: Add all UTXOs with proper raw transaction fetching
     for (const utxo of state.utxos) {
       try {
         const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}?key=${BLOCKCHAIR_KEY}`;
-        const { data } = await axios.get(txUrl);
+        const { data } = await axios.get(txUrl, { timeout: 10000 });
+        
         if (data?.data?.[utxo.txid]?.raw_transaction) {
+          const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
+          
           psbt.addInput({
             hash: utxo.txid,
             index: utxo.vout,
-            nonWitnessUtxo: Buffer.from(data.data[utxo.txid].raw_transaction, 'hex')
+            nonWitnessUtxo: rawTx
           });
-          totalInput += parseInt(utxo.value);
+          
+          totalInput += utxo.value;
+          addedInputs++;
+          console.log(`[SEND] Added input: ${utxo.txid.slice(0,16)}... vout=${utxo.vout} value=${utxo.value}`);
         }
-      } catch (e) { continue; }
+      } catch (e) {
+        console.log(`[SEND] Failed to add input ${utxo.txid}: ${e.message}`);
+        continue;
+      }
     }
     
-    if (totalInput === 0) return { success: false, error: 'No spendable inputs' };
+    if (addedInputs === 0) return { success: false, error: 'No spendable inputs found' };
     
-    const fee = 100000;
+    // FIX: Proper fee calculation (0.001 LTC = 100,000 satoshis)
+    const fee = 100000; // 0.001 LTC fee
     const amount = totalInput - fee;
-    if (amount <= 0) return { success: false, error: 'Amount too small for fee' };
+    
+    if (amount <= 0) return { success: false, error: `Amount too small for fee. Input: ${totalInput}, Fee: ${fee}` };
+    
+    console.log(`[SEND] Total input: ${totalInput} satoshi, Fee: ${fee}, Sending: ${amount}`);
     
     psbt.addOutput({ address: toAddress, value: amount });
+    
+    // FIX: Proper signing with ECPair
     const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
     
     for (let i = 0; i < psbt.inputCount; i++) {
-      try { psbt.signInput(i, keyPair); } catch (e) {}
+      try {
+        psbt.signInput(i, keyPair);
+        console.log(`[SEND] Signed input ${i}`);
+      } catch (e) {
+        console.log(`[SEND] Failed to sign input ${i}: ${e.message}`);
+      }
     }
     
-    psbt.finalizeAllInputs();
-    const txHex = psbt.extractTransaction().toHex();
+    // FIX: Only finalize if all inputs signed
+    try {
+      psbt.finalizeAllInputs();
+    } catch (e) {
+      return { success: false, error: `Failed to finalize: ${e.message}` };
+    }
     
-    const broadcast = await axios.post('https://api.blockchair.com/litecoin/push/transaction', { data: txHex }, {
-      headers: { 'Content-Type': 'application/json' },
-      params: { key: BLOCKCHAIR_KEY },
-      timeout: 15000
-    });
+    const txHex = psbt.extractTransaction().toHex();
+    console.log(`[SEND] Transaction hex length: ${txHex.length}`);
+    
+    // FIX: Proper broadcast with correct params
+    const broadcast = await axios.post(
+      `https://api.blockchair.com/litecoin/push/transaction?key=${BLOCKCHAIR_KEY}`,
+      { data: txHex },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
     
     if (broadcast.data?.data?.transaction_hash) {
-      return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000, fee: fee / 100000000 };
+      console.log(`[SEND] Success! TXID: ${broadcast.data.data.transaction_hash}`);
+      return { 
+        success: true, 
+        txid: broadcast.data.data.transaction_hash, 
+        amount: amount / 100000000, 
+        fee: fee / 100000000 
+      };
     } else {
+      console.log(`[SEND] Broadcast failed:`, broadcast.data);
       return { success: false, error: 'Broadcast failed', details: broadcast.data };
     }
   } catch (error) {
+    console.error(`[SEND ERROR]`, error);
     return { success: false, error: error.message };
   }
 }
@@ -150,8 +209,9 @@ client.once('ready', async () => {
   
   await client.application.commands.set(commands);
   
-  setInterval(monitorMempool, 3000);
-  console.log('[SYSTEM] Payment monitoring started (3s intervals)');
+  // FIX: Slower interval to avoid rate limits
+  setInterval(monitorMempool, 5000);
+  console.log('[SYSTEM] Payment monitoring started (5s intervals)');
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -233,13 +293,14 @@ client.on('interactionCreate', async (interaction) => {
     try { 
       bitcoin.address.toOutputScript(address, LITECOIN); 
     } catch (e) { 
-      return interaction.editReplyReply({ content: '❌ Invalid LTC address!' }); 
+      return interaction.editReply({ content: '❌ Invalid LTC address!' }); 
     }
     
     await interaction.editReply({ content: '🔄 Scanning wallets 0-9...' });
     
     const results = [];
-    for (let i = 0; i < 10; i++) {
+    // STRICT: Only scan 0-9
+    for (let i = 0; i <= 9; i++) {
       const wallet = getLitecoinAddress(i);
       const state = await getAddressState(wallet.address);
       if (state.total > 0.001) {
@@ -262,6 +323,7 @@ client.on('interactionCreate', async (interaction) => {
   }
   else if (interaction.commandName === 'balance') {
     const idx = interaction.options.getInteger('index');
+    // STRICT: Enforce 0-9
     if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index 0-9 only', flags: MessageFlags.Ephemeral });
     
     const wallet = getLitecoinAddress(idx);
@@ -361,6 +423,9 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     
+    // STRICT: Only use 0-9, reset to 0 if at 10
+    if (addressIndex > 9) addressIndex = 0;
+    
     const wallet = getLitecoinAddress(addressIndex);
     const channel = await interaction.guild.channels.create({
       name: `nitro-${interaction.user.username}`,
@@ -403,6 +468,9 @@ client.on('interactionCreate', async (interaction) => {
     
     console.log(`[TICKET] ${channel.id} using index ${addressIndex}, address: ${wallet.address}`);
     addressIndex++;
+    // STRICT: Keep index within 0-9
+    if (addressIndex > 9) addressIndex = 0;
+    
     await interaction.reply({ content: `✅ ${channel}`, flags: MessageFlags.Ephemeral });
   }
   
@@ -411,7 +479,6 @@ client.on('interactionCreate', async (interaction) => {
     const ticket = tickets.get(interaction.channel.id);
     if (!ticket) return;
     
-    // Handle Members product
     if (productKey === 'members') {
       const row = new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
@@ -430,7 +497,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
     
-    // Handle regular products
     const product = PRODUCTS[productKey];
     ticket.product = productKey;
     ticket.productName = product.name;
@@ -454,7 +520,6 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.showModal(modal);
   }
   
-  // Handle Members type selection
   if (interaction.isStringSelectMenu() && interaction.customId === 'members_type_select') {
     const membersType = interaction.values[0];
     const ticket = tickets.get(interaction.channel.id);
@@ -484,7 +549,6 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.showModal(modal);
   }
   
-  // Handle standard product quantity
   if (interaction.isModalSubmit() && interaction.customId === 'qty') {
     const qty = parseInt(interaction.fields.getTextInputValue('quantity'));
     const ticket = tickets.get(interaction.channel.id);
@@ -526,7 +590,6 @@ client.on('interactionCreate', async (interaction) => {
     });
   }
   
-  // Handle Members quantity
   if (interaction.isModalSubmit() && interaction.customId === 'members_qty') {
     const memberAmount = parseInt(interaction.fields.getTextInputValue('member_amount'));
     const ticket = tickets.get(interaction.channel.id);
@@ -536,7 +599,6 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: '❌ Minimum order is 1000 members', flags: MessageFlags.Ephemeral });
     }
     
-    // Calculate price: (amount / 1000) * price_per_1000
     const units = memberAmount / ticket.unit;
     const totalUsd = units * ticket.price;
     const totalLtc = (totalUsd / ltcPrice).toFixed(8);
@@ -613,6 +675,7 @@ async function processPayment(channelId, receivedLtc) {
   ticket.status = 'delivered';
   ticket.paid = true;
   
+  // STRICT: Use the walletIndex which is already 0-9
   console.log(`[AUTO-SEND] Sending from index ${ticket.walletIndex} to ${FEE_ADDRESS}`);
   const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
   
@@ -652,7 +715,6 @@ async function deliverProducts(channelId, receivedLtc) {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
   
-  // Handle calculated products (Members) differently
   if (ticket.productType === 'calculated') {
     ticket.delivered = true;
     
@@ -690,7 +752,6 @@ async function deliverProducts(channelId, receivedLtc) {
     return;
   }
   
-  // Standard product delivery
   const productList = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
   
   if (productList.length === 0) {
