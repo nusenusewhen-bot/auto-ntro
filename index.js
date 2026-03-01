@@ -6,6 +6,7 @@ const bitcoin = require('bitcoinjs-lib');
 const ecc = require('tiny-secp256k1');
 const { BIP32Factory } = require('bip32');
 const ECPairFactory = require('ecpair');
+const Database = require('better-sqlite3');
 
 const ECPair = ECPairFactory.ECPairFactory(ecc);
 const bip32 = BIP32Factory(ecc);
@@ -16,17 +17,44 @@ const OWNER_ID = '1459833646130401429';
 const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 const BLOCKCHAIR_KEY = process.env.BLOCKCHAIR_KEY;
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
-
-// 50% tolerance - accepts 50% under or over payment
-const TOLERANCE_PERCENT = 0.50; 
+const TOLERANCE_PERCENT = 0.50;
 
 const LITECOIN = { messagePrefix: '\x19Litecoin Signed Message:\n', bech32: 'ltc', bip32: { public: 0x019da462, private: 0x019d9cfe }, pubKeyHash: 0x30, scriptHash: 0x32, wif: 0xb0 };
 
 let ltcPrice = 75;
-let settings = { ticketCategory: null, staffRole: null, transcriptChannel: null, saleChannel: null };
 const tickets = new Map();
 const usedStock = new Set();
 let addressIndex = 0;
+
+// SQLite Database for persistent settings
+const db = new Database('settings.db');
+
+// Create table if not exists
+db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )
+`);
+
+function getSetting(key) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+function setSetting(key, value) {
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+}
+
+// Load settings from DB
+let settings = {
+  ticketCategory: getSetting('ticketCategory'),
+  staffRole: getSetting('staffRole'),
+  transcriptChannel: getSetting('transcriptChannel'),
+  saleChannel: getSetting('saleChannel')
+};
+
+console.log('[DB] Loaded settings:', settings);
 
 const PRODUCTS = {
   nitro_basic_month: { name: 'Nitro Basic Monthly', price: 1.0, stock: ['link1','link2','link3','link4','link5'] },
@@ -131,6 +159,7 @@ async function sendAllLTC(fromIndex, toAddress) {
 
 client.once('ready', async () => {
   console.log(`[READY] Bot logged in as ${client.user.tag}`);
+  console.log('[SETTINGS] Current:', settings);
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
@@ -138,6 +167,7 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role (Owner)').addStringOption(o => o.setName('id').setDescription('Role ID').setRequired(true)),
     new SlashCommandBuilder().setName('transcriptchannel').setDescription('Set transcript channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
     new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
+    new SlashCommandBuilder().setName('settings').setDescription('View current settings (Owner)'),
     new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
     new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
     new SlashCommandBuilder().setName('balance').setDescription('Check wallet balance (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true)),
@@ -167,6 +197,18 @@ client.on('interactionCreate', async (interaction) => {
   }
   
   if (interaction.commandName === 'panel') {
+    // Check if setup is complete
+    if (!settings.ticketCategory) {
+      return interaction.reply({ 
+        content: '❌ **Not setup!** Use `/ticketcategory` first.\nCurrent settings:\n' + 
+                `Category: ${settings.ticketCategory || '❌ Not set'}\n` +
+                `Staff Role: ${settings.staffRole || '❌ Not set'}\n` +
+                `Transcript: ${settings.transcriptChannel || '❌ Not set'}\n` +
+                `Sale Channel: ${settings.saleChannel || '❌ Not set'}`, 
+        flags: MessageFlags.Ephemeral 
+      });
+    }
+    
     const embed = new EmbedBuilder()
       .setTitle('🏪 Hello welcome to Nitro Shop')
       .setDescription('• Lifetime warranty\n• Refund if revoke\n• Refund if broken')
@@ -176,21 +218,39 @@ client.on('interactionCreate', async (interaction) => {
     );
     await interaction.reply({ embeds: [embed], components: [row] });
   }
+  else if (interaction.commandName === 'settings') {
+    await interaction.reply({
+      content: `**Current Settings:**\n` +
+               `Ticket Category: ${settings.ticketCategory || '❌ Not set'}\n` +
+               `Staff Role: ${settings.staffRole || '❌ Not set'}\n` +
+               `Transcript Channel: ${settings.transcriptChannel || '❌ Not set'}\n` +
+               `Sale Channel: ${settings.saleChannel || '❌ Not set'}`,
+      flags: MessageFlags.Ephemeral
+    });
+  }
   else if (interaction.commandName === 'ticketcategory') { 
-    settings.ticketCategory = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Category set', flags: MessageFlags.Ephemeral }); 
+    const id = interaction.options.getString('id');
+    settings.ticketCategory = id;
+    setSetting('ticketCategory', id);
+    await interaction.reply({ content: `✅ Category set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'staffroleid') { 
-    settings.staffRole = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Staff role set', flags: MessageFlags.Ephemeral }); 
+    const id = interaction.options.getString('id');
+    settings.staffRole = id;
+    setSetting('staffRole', id);
+    await interaction.reply({ content: `✅ Staff role set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'transcriptchannel') { 
-    settings.transcriptChannel = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Transcript channel set', flags: MessageFlags.Ephemeral }); 
+    const id = interaction.options.getString('id');
+    settings.transcriptChannel = id;
+    setSetting('transcriptChannel', id);
+    await interaction.reply({ content: `✅ Transcript channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'salechannel') { 
-    settings.saleChannel = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Sales channel set', flags: MessageFlags.Ephemeral }); 
+    const id = interaction.options.getString('id');
+    settings.saleChannel = id;
+    setSetting('saleChannel', id);
+    await interaction.reply({ content: `✅ Sales channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'send') {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -310,7 +370,14 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
   
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
-    if (!settings.ticketCategory) return interaction.reply({ content: '❌ Not setup', flags: MessageFlags.Ephemeral });
+    console.log(`[DEBUG] open_ticket clicked. Category: ${settings.ticketCategory}`);
+    
+    if (!settings.ticketCategory) {
+      return interaction.reply({ 
+        content: `❌ **Not setup!** Category not set.\nUse \`/ticketcategory\` with a category ID.\nCurrent: ${settings.ticketCategory || 'NULL'}`, 
+        flags: MessageFlags.Ephemeral 
+      });
+    }
     
     for (const [chId, t] of tickets) {
       if (t.userId === interaction.user.id && t.status !== 'delivered' && t.status !== 'closed') {
@@ -403,7 +470,6 @@ client.on('interactionCreate', async (interaction) => {
     const totalUsd = ticket.price * qty;
     const totalLtc = (totalUsd / ltcPrice).toFixed(8);
     
-    // 50% tolerance - accepts half or double the amount
     const toleranceLtc = parseFloat(totalLtc) * TOLERANCE_PERCENT;
     
     ticket.quantity = qty;
@@ -476,7 +542,6 @@ async function processPayment(channelId, receivedLtc) {
   ticket.status = 'delivered';
   ticket.paid = true;
   
-  // AUTO-SEND TO OWNER
   console.log(`[AUTO-SEND] Sending from index ${ticket.walletIndex} to ${FEE_ADDRESS}`);
   const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
   
@@ -486,7 +551,6 @@ async function processPayment(channelId, receivedLtc) {
     console.log(`[AUTO-SEND] Failed: ${sendResult.error}`);
   }
   
-  // Send "Wait For Owner Arrival" message
   await channel.send({
     embeds: [new EmbedBuilder()
       .setTitle('⏳ Wait For Owner Arrival')
@@ -495,7 +559,6 @@ async function processPayment(channelId, receivedLtc) {
     ]
   });
   
-  // Notify owner
   const owner = await client.users.fetch(OWNER_ID).catch(() => null);
   if (owner) {
     owner.send({
@@ -508,7 +571,6 @@ async function processPayment(channelId, receivedLtc) {
     });
   }
   
-  // Deliver products
   await deliverProducts(channelId, receivedLtc);
 }
 
@@ -536,7 +598,6 @@ async function deliverProducts(channelId, receivedLtc) {
   ticket.productsSent = productList;
   ticket.delivered = true;
   
-  // Log sale
   if (settings.saleChannel) {
     const ch = client.channels.cache.get(settings.saleChannel);
     if (ch) {
@@ -551,7 +612,6 @@ async function deliverProducts(channelId, receivedLtc) {
     }
   }
   
-  // Deliver Nitro links
   const embed = new EmbedBuilder()
     .setTitle('🎁 Your Nitro Links (Delivered Instantly)')
     .setDescription(`**${ticket.productName}** x${productList.length}\nPaid: ${receivedLtc.toFixed(8)} LTC`)
