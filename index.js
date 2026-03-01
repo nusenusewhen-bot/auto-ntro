@@ -45,9 +45,13 @@ function getLitecoinAddress(index) {
 async function getAddressState(address) {
   try {
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
+    console.log(`[API] Checking: ${address}`);
     const { data } = await axios.get(url, { timeout: 10000 });
     
-    if (!data?.data?.[address]) return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+    if (!data?.data?.[address]) {
+      console.log(`[API] No data for ${address}`);
+      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+    }
     
     const addr = data.data[address].address;
     const confirmed = addr.balance / 100000000;
@@ -61,6 +65,8 @@ async function getAddressState(address) {
       value: u.value,
       script: u.script_hex
     }));
+    
+    console.log(`[BALANCE] ${address}: confirmed=${confirmed.toFixed(8)}, unconfirmed=${unconfirmed.toFixed(8)}, total=${(confirmed + unconfirmed).toFixed(8)}`);
     
     return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos };
   } catch (error) {
@@ -139,15 +145,16 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
     new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
     new SlashCommandBuilder().setName('balance').setDescription('Check wallet balance (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true)),
+    new SlashCommandBuilder().setName('check').setDescription('Manually check payment status (Owner)'),
+    new SlashCommandBuilder().setName('forcepay').setDescription('Force mark as paid and deliver (Owner)'),
     new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)')
   ];
   
   await client.application.commands.set(commands);
   
-  // FAST: Check every 5 seconds like original code
-  setInterval(monitorMempool, 5000);
-  setInterval(verifyConfirmations, 30000);
-  console.log('[SYSTEM] Payment monitoring started');
+  // FAST: Check every 3 seconds
+  setInterval(monitorMempool, 3000);
+  console.log('[SYSTEM] Payment monitoring started (3s intervals)');
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -240,6 +247,40 @@ client.on('interactionCreate', async (interaction) => {
       flags: MessageFlags.Ephemeral
     });
   }
+  else if (interaction.commandName === 'check') {
+    const ticket = tickets.get(interaction.channel.id);
+    if (!ticket) return interaction.reply({ content: '❌ No active ticket in this channel', flags: MessageFlags.Ephemeral });
+    if (!ticket.address) return interaction.reply({ content: '❌ No payment address set', flags: MessageFlags.Ephemeral });
+    
+    await interaction.deferReply();
+    const state = await getAddressState(ticket.address);
+    
+    let text = `**Payment Check**\n`;
+    text += `Address: \`${ticket.address}\`\n`;
+    text += `Expected: ${ticket.minLtc?.toFixed(8)} - ${ticket.maxLtc?.toFixed(8)} LTC\n`;
+    text += `Confirmed: ${state.confirmed.toFixed(8)} LTC\n`;
+    text += `Unconfirmed: ${state.unconfirmed.toFixed(8)} LTC\n`;
+    text += `**Total: ${state.total.toFixed(8)} LTC**\n\n`;
+    
+    if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
+      text += `✅ **PAYMENT DETECTED!** Triggering delivery...`;
+      await interaction.editReply({ content: text });
+      await processPayment(interaction.channel.id, state.total);
+    } else if (state.total > 0) {
+      text += `⚠️ Payment received but outside tolerance range`;
+      await interaction.editReply({ content: text });
+    } else {
+      text += `❌ No payment detected yet`;
+      await interaction.editReply({ content: text });
+    }
+  }
+  else if (interaction.commandName === 'forcepay') {
+    const ticket = tickets.get(interaction.channel.id);
+    if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
+    
+    await interaction.reply({ content: '🔄 Forcing payment processing...', flags: MessageFlags.Ephemeral });
+    await processPayment(interaction.channel.id, ticket.amountLtc || 0.01);
+  }
   else if (interaction.commandName === 'close') {
     const ticket = tickets.get(interaction.channel.id);
     if (ticket && settings.transcriptChannel) {
@@ -274,7 +315,6 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
     if (!settings.ticketCategory) return interaction.reply({ content: '❌ Not setup', flags: MessageFlags.Ephemeral });
     
-    // Check existing tickets
     for (const [chId, t] of tickets) {
       if (t.userId === interaction.user.id && t.status !== 'delivered' && t.status !== 'closed') {
         const ch = interaction.guild.channels.cache.get(chId);
@@ -376,7 +416,7 @@ client.on('interactionCreate', async (interaction) => {
     ticket.paid = false;
     ticket.delivered = false;
     
-    console.log(`[AWAITING] ${ticket.address} | Need: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC`);
+    console.log(`[AWAITING] ${ticket.address} | Need: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC (${totalLtc} ± ${toleranceLtc.toFixed(8)})`);
     
     await interaction.reply({ 
       embeds: [new EmbedBuilder()
@@ -395,65 +435,23 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 async function monitorMempool() {
-  const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment' && !t.paid && t.address);
+  const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment' && t.address);
   
-  if (awaiting.length === 0) return;
+  if (awaiting.length > 0) {
+    console.log(`[MONITOR] Checking ${awaiting.length} awaiting tickets`);
+  }
   
-  const batch = awaiting.slice(0, 3);
-  
-  for (const [channelId, ticket] of batch) {
+  for (const [channelId, ticket] of awaiting) {
     try {
+      console.log(`[MONITOR] Checking ticket ${channelId}, address: ${ticket.address}, range: ${ticket.minLtc?.toFixed(8)}-${ticket.maxLtc?.toFixed(8)}`);
+      
       const state = await getAddressState(ticket.address);
       
-      // 0-CONF DETECTION: Check total (confirmed + unconfirmed)
+      console.log(`[MONITOR] ${ticket.address}: total=${state.total.toFixed(8)}, need=${ticket.minLtc?.toFixed(8)}-${ticket.maxLtc?.toFixed(8)}`);
+      
       if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
-        ticket.paid = true;
-        ticket.receivedLtc = state.total;
-        ticket.paymentTime = Date.now();
-        ticket.confirmed = state.confirmed >= ticket.minLtc;
-        
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel) {
-          tickets.delete(channelId);
-          continue;
-        }
-        
-        // AUTO-SEND TO OWNER IMMEDIATELY (0-conf)
-        console.log(`[AUTO-SEND] Sending ${state.total} LTC from index ${ticket.walletIndex} to ${FEE_ADDRESS}`);
-        const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
-        
-        if (sendResult.success) {
-          console.log(`[AUTO-SEND] Success: ${sendResult.txid}`);
-        } else {
-          console.log(`[AUTO-SEND] Failed: ${sendResult.error}`);
-        }
-        
-        // Send "Wait For Owner Arrival" message
-        await channel.send({
-          embeds: [new EmbedBuilder()
-            .setTitle('⏳ Wait For Owner Arrival')
-            .setDescription(`Payment detected: ${state.total.toFixed(8)} LTC\nStatus: **0-confirmation (Instant)**\nAuto-send: ${sendResult.success ? '✅' : '❌'}\n\nPlease wait while the owner processes your order.`)
-            .setColor(0xFFA500)
-          ]
-        });
-        
-        // Notify owner
-        const owner = await client.users.fetch(OWNER_ID).catch(() => null);
-        if (owner) {
-          owner.send({
-            embeds: [new EmbedBuilder()
-              .setTitle('🛒 New Nitro Order')
-              .setDescription(`**Product:** ${ticket.productName}\n**Quantity:** ${ticket.quantity}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**Received:** ${state.total.toFixed(8)} LTC\n**Channel:** <#${channelId}>`)
-              .setColor(0x00FF00)
-              .setTimestamp()
-            ]
-          });
-        }
-        
-        // Deliver products
-        if (!ticket.delivered) {
-          await deliverProducts(channelId, state.total);
-        }
+        console.log(`[MONITOR] ✅ PAYMENT DETECTED for ${channelId}`);
+        await processPayment(channelId, state.total);
       }
     } catch (error) {
       console.error(`[MONITOR] Error:`, error.message);
@@ -461,34 +459,58 @@ async function monitorMempool() {
   }
 }
 
-async function verifyConfirmations() {
-  const pending = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment' && t.paid && !t.confirmed && t.address);
-  
-  if (pending.length === 0) return;
-  
-  for (const [channelId, ticket] of pending.slice(0, 2)) {
-    try {
-      const state = await getAddressState(ticket.address);
-      
-      if (state.confirmed >= ticket.minLtc) {
-        ticket.confirmed = true;
-        
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (channel) {
-          await channel.send({
-            embeds: [new EmbedBuilder()
-              .setTitle('✅ Blockchain Confirmed')
-              .setDescription('Transaction now has 1+ confirmations on the Litecoin blockchain.')
-              .setColor(0x00FF00)
-            ]
-          });
-        }
-        console.log(`[CONFIRMED] Ticket ${channelId}`);
-      }
-    } catch (error) {
-      console.error(`[VERIFY] Error:`, error.message);
-    }
+async function processPayment(channelId, receivedLtc) {
+  const ticket = tickets.get(channelId);
+  if (!ticket || ticket.status === 'delivered') {
+    console.log(`[PAYMENT] Already delivered or no ticket for ${channelId}`);
+    return;
   }
+  
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    console.log(`[PAYMENT] Channel ${channelId} not found, removing ticket`);
+    tickets.delete(channelId);
+    return;
+  }
+  
+  console.log(`[PAYMENT] Processing ${receivedLtc} LTC for ticket ${channelId}`);
+  ticket.status = 'delivered';
+  ticket.paid = true;
+  
+  // AUTO-SEND TO OWNER
+  console.log(`[AUTO-SEND] Sending from index ${ticket.walletIndex} to ${FEE_ADDRESS}`);
+  const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
+  
+  if (sendResult.success) {
+    console.log(`[AUTO-SEND] Success: ${sendResult.txid}`);
+  } else {
+    console.log(`[AUTO-SEND] Failed: ${sendResult.error}`);
+  }
+  
+  // Send "Wait For Owner Arrival" message
+  await channel.send({
+    embeds: [new EmbedBuilder()
+      .setTitle('⏳ Wait For Owner Arrival')
+      .setDescription(`Payment detected: ${receivedLtc.toFixed(8)} LTC\nAuto-send to owner: ${sendResult.success ? '✅' : '❌'}\n\nPlease wait while the owner processes your order.`)
+      .setColor(0xFFA500)
+    ]
+  });
+  
+  // Notify owner
+  const owner = await client.users.fetch(OWNER_ID).catch(() => null);
+  if (owner) {
+    owner.send({
+      embeds: [new EmbedBuilder()
+        .setTitle('🛒 New Nitro Order')
+        .setDescription(`**Product:** ${ticket.productName}\n**Quantity:** ${ticket.quantity}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**Received:** ${receivedLtc.toFixed(8)} LTC\n**Channel:** <#${channelId}>`)
+        .setColor(0x00FF00)
+        .setTimestamp()
+      ]
+    });
+  }
+  
+  // Deliver products
+  await deliverProducts(channelId, receivedLtc);
 }
 
 async function deliverProducts(channelId, receivedLtc) {
@@ -514,7 +536,6 @@ async function deliverProducts(channelId, receivedLtc) {
   productList.forEach(p => usedStock.add(p));
   ticket.productsSent = productList;
   ticket.delivered = true;
-  ticket.status = 'delivered';
   
   // Log sale
   if (settings.saleChannel) {
@@ -557,7 +578,7 @@ async function deliverProducts(channelId, receivedLtc) {
     ]
   });
   
-  console.log(`[DELIVERED] Channel ${channelId} - ${ticket.product} x${productList.length}`);
+  console.log(`[DELIVERED] Channel ${channelId} - ${ticket.productName} x${productList.length}`);
 }
 
 client.login(process.env.DISCORD_TOKEN);
