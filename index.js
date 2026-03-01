@@ -6,7 +6,6 @@ const bitcoin = require('bitcoinjs-lib');
 const ecc = require('tiny-secp256k1');
 const { BIP32Factory } = require('bip32');
 const ECPairFactory = require('ecpair');
-const Database = require('better-sqlite3');
 
 const ECPair = ECPairFactory.ECPairFactory(ecc);
 const bip32 = BIP32Factory(ecc);
@@ -22,45 +21,18 @@ const TOLERANCE_PERCENT = 0.50;
 const LITECOIN = { messagePrefix: '\x19Litecoin Signed Message:\n', bech32: 'ltc', bip32: { public: 0x019da462, private: 0x019d9cfe }, pubKeyHash: 0x30, scriptHash: 0x32, wif: 0xb0 };
 
 let ltcPrice = 75;
+let settings = { ticketCategory: null, staffRole: null, transcriptChannel: null, saleChannel: null };
 const tickets = new Map();
 const usedStock = new Set();
 let addressIndex = 0;
-
-// SQLite Database for persistent settings
-const db = new Database('settings.db');
-
-// Create table if not exists
-db.exec(`
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  )
-`);
-
-function getSetting(key) {
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-  return row ? row.value : null;
-}
-
-function setSetting(key, value) {
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
-}
-
-// Load settings from DB
-let settings = {
-  ticketCategory: getSetting('ticketCategory'),
-  staffRole: getSetting('staffRole'),
-  transcriptChannel: getSetting('transcriptChannel'),
-  saleChannel: getSetting('saleChannel')
-};
-
-console.log('[DB] Loaded settings:', settings);
 
 const PRODUCTS = {
   nitro_basic_month: { name: 'Nitro Basic Monthly', price: 1.0, stock: ['link1','link2','link3','link4','link5'] },
   nitro_basic_year: { name: 'Nitro Basic Yearly', price: 7.0, stock: ['link1','link2','link3'] },
   nitro_boost_month: { name: 'Nitro Boost Monthly', price: 2.8, stock: ['link1','link2','link3','link4'] },
-  nitro_boost_year: { name: 'Nitro Boost Yearly', price: 14.0, stock: ['link1','link2'] }
+  nitro_boost_year: { name: 'Nitro Boost Yearly', price: 14.0, stock: ['link1','link2'] },
+  members_offline: { name: 'Members (Offline)', price: 0.7, unit: 1000, type: 'calculated' },
+  members_online: { name: 'Members (Online)', price: 1.5, unit: 1000, type: 'calculated' }
 };
 
 function getLitecoinAddress(index) {
@@ -159,7 +131,7 @@ async function sendAllLTC(fromIndex, toAddress) {
 
 client.once('ready', async () => {
   console.log(`[READY] Bot logged in as ${client.user.tag}`);
-  console.log('[SETTINGS] Current:', settings);
+  console.log('[SETTINGS] Current:', JSON.stringify(settings));
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
@@ -197,14 +169,16 @@ client.on('interactionCreate', async (interaction) => {
   }
   
   if (interaction.commandName === 'panel') {
-    // Check if setup is complete
+    console.log(`[DEBUG] /panel used. Category: ${settings.ticketCategory}`);
+    
     if (!settings.ticketCategory) {
       return interaction.reply({ 
-        content: '❌ **Not setup!** Use `/ticketcategory` first.\nCurrent settings:\n' + 
-                `Category: ${settings.ticketCategory || '❌ Not set'}\n` +
-                `Staff Role: ${settings.staffRole || '❌ Not set'}\n` +
-                `Transcript: ${settings.transcriptChannel || '❌ Not set'}\n` +
-                `Sale Channel: ${settings.saleChannel || '❌ Not set'}`, 
+        content: `❌ **Not setup!** Use these commands first:\n\n` +
+                `1. \`/ticketcategory\` (ID: ${settings.ticketCategory || 'NOT SET'})\n` +
+                `2. \`/staffroleid\` (ID: ${settings.staffRole || 'NOT SET'})\n` +
+                `3. \`/transcriptchannel\` (ID: ${settings.transcriptChannel || 'NOT SET'})\n` +
+                `4. \`/salechannel\` (ID: ${settings.saleChannel || 'NOT SET'})\n\n` +
+                `Use \`/settings\` to check current values.`, 
         flags: MessageFlags.Ephemeral 
       });
     }
@@ -231,25 +205,25 @@ client.on('interactionCreate', async (interaction) => {
   else if (interaction.commandName === 'ticketcategory') { 
     const id = interaction.options.getString('id');
     settings.ticketCategory = id;
-    setSetting('ticketCategory', id);
-    await interaction.reply({ content: `✅ Category set to: ${id}`, flags: MessageFlags.Ephemeral }); 
+    console.log(`[SETTINGS] Category set to: ${id}`);
+    await interaction.reply({ content: `✅ Category set to: ${id}\n\nNow use \`/panel\` to spawn the shop.`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'staffroleid') { 
     const id = interaction.options.getString('id');
     settings.staffRole = id;
-    setSetting('staffRole', id);
+    console.log(`[SETTINGS] Staff role set to: ${id}`);
     await interaction.reply({ content: `✅ Staff role set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'transcriptchannel') { 
     const id = interaction.options.getString('id');
     settings.transcriptChannel = id;
-    setSetting('transcriptChannel', id);
+    console.log(`[SETTINGS] Transcript set to: ${id}`);
     await interaction.reply({ content: `✅ Transcript channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'salechannel') { 
     const id = interaction.options.getString('id');
     settings.saleChannel = id;
-    setSetting('saleChannel', id);
+    console.log(`[SETTINGS] Sale channel set to: ${id}`);
     await interaction.reply({ content: `✅ Sales channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'send') {
@@ -259,7 +233,7 @@ client.on('interactionCreate', async (interaction) => {
     try { 
       bitcoin.address.toOutputScript(address, LITECOIN); 
     } catch (e) { 
-      return interaction.editReply({ content: '❌ Invalid LTC address!' }); 
+      return interaction.editReplyReply({ content: '❌ Invalid LTC address!' }); 
     }
     
     await interaction.editReply({ content: '🔄 Scanning wallets 0-9...' });
@@ -374,7 +348,7 @@ client.on('interactionCreate', async (interaction) => {
     
     if (!settings.ticketCategory) {
       return interaction.reply({ 
-        content: `❌ **Not setup!** Category not set.\nUse \`/ticketcategory\` with a category ID.\nCurrent: ${settings.ticketCategory || 'NULL'}`, 
+        content: `❌ **Not setup!** Category not set.\n\nUse \`/ticketcategory\` with a category ID first.\nCurrent value: ${settings.ticketCategory || 'NULL'}\n\nUse \`/settings\` to see all settings.`, 
         flags: MessageFlags.Ephemeral 
       });
     }
@@ -407,13 +381,14 @@ client.on('interactionCreate', async (interaction) => {
           { label: 'Nitro Basic Monthly - $1.00', value: 'nitro_basic_month', emoji: '💎' },
           { label: 'Nitro Basic Yearly - $7.00', value: 'nitro_basic_year', emoji: '💎' },
           { label: 'Nitro Boost Monthly - $2.80', value: 'nitro_boost_month', emoji: '🔥' },
-          { label: 'Nitro Boost Yearly - $14.00', value: 'nitro_boost_year', emoji: '🔥' }
+          { label: 'Nitro Boost Yearly - $14.00', value: 'nitro_boost_year', emoji: '🔥' },
+          { label: 'Members', value: 'members', emoji: '👥' }
         )
     );
     
     await channel.send({ 
       content: `${interaction.user}`, 
-      embeds: [new EmbedBuilder().setTitle('🛒 Select Nitro').setColor(0x00FF00)], 
+      embeds: [new EmbedBuilder().setTitle('🛒 Select Product').setColor(0x00FF00)], 
       components: [row] 
     });
     
@@ -432,13 +407,35 @@ client.on('interactionCreate', async (interaction) => {
   }
   
   if (interaction.isStringSelectMenu() && interaction.customId === 'product_select') {
-    const product = PRODUCTS[interaction.values[0]];
+    const productKey = interaction.values[0];
     const ticket = tickets.get(interaction.channel.id);
     if (!ticket) return;
     
-    ticket.product = interaction.values[0];
+    // Handle Members product
+    if (productKey === 'members') {
+      const row = new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId('members_type_select')
+          .setPlaceholder('Choose Members Type')
+          .addOptions(
+            { label: 'Offline Members - $0.70 per 1000', value: 'members_offline', emoji: '⚫', description: 'Offline server members' },
+            { label: 'Online Members - $1.50 per 1000', value: 'members_online', emoji: '🟢', description: 'Online server members' }
+          )
+      );
+      
+      await interaction.update({ 
+        embeds: [new EmbedBuilder().setTitle('👥 Choose Members Type').setDescription('Select the type of members you want:').setColor(0x00FF00)], 
+        components: [row] 
+      });
+      return;
+    }
+    
+    // Handle regular products
+    const product = PRODUCTS[productKey];
+    ticket.product = productKey;
     ticket.productName = product.name;
     ticket.price = product.price;
+    ticket.productType = 'standard';
     
     const modal = new ModalBuilder()
       .setCustomId('qty')
@@ -457,6 +454,37 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.showModal(modal);
   }
   
+  // Handle Members type selection
+  if (interaction.isStringSelectMenu() && interaction.customId === 'members_type_select') {
+    const membersType = interaction.values[0];
+    const ticket = tickets.get(interaction.channel.id);
+    if (!ticket) return;
+    
+    const product = PRODUCTS[membersType];
+    ticket.product = membersType;
+    ticket.productName = product.name;
+    ticket.price = product.price;
+    ticket.unit = product.unit;
+    ticket.productType = 'calculated';
+    
+    const modal = new ModalBuilder()
+      .setCustomId('members_qty')
+      .setTitle('Enter Amount of Members')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('member_amount')
+            .setLabel(`How many members? (in multiples of ${product.unit})`)
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('1000')
+            .setRequired(true)
+        )
+      );
+    
+    await interaction.showModal(modal);
+  }
+  
+  // Handle standard product quantity
   if (interaction.isModalSubmit() && interaction.customId === 'qty') {
     const qty = parseInt(interaction.fields.getTextInputValue('quantity'));
     const ticket = tickets.get(interaction.channel.id);
@@ -487,6 +515,49 @@ client.on('interactionCreate', async (interaction) => {
       embeds: [new EmbedBuilder()
         .setTitle('💳 Payment')
         .setDescription(`**${ticket.productName}** x${qty}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
+        .addFields(
+          { name: '📋 LTC Address', value: `\`${ticket.address}\`` },
+          { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
+          { name: '⚡ Detection', value: 'INSTANT (0-confirmation)' }
+        )
+        .setColor(0xFFD700)
+        .setFooter({ text: 'Send LTC now. Bot detects instantly and auto-sends!' })
+      ] 
+    });
+  }
+  
+  // Handle Members quantity
+  if (interaction.isModalSubmit() && interaction.customId === 'members_qty') {
+    const memberAmount = parseInt(interaction.fields.getTextInputValue('member_amount'));
+    const ticket = tickets.get(interaction.channel.id);
+    if (!ticket) return;
+    
+    if (isNaN(memberAmount) || memberAmount < 1000) {
+      return interaction.reply({ content: '❌ Minimum order is 1000 members', flags: MessageFlags.Ephemeral });
+    }
+    
+    // Calculate price: (amount / 1000) * price_per_1000
+    const units = memberAmount / ticket.unit;
+    const totalUsd = units * ticket.price;
+    const totalLtc = (totalUsd / ltcPrice).toFixed(8);
+    
+    const toleranceLtc = parseFloat(totalLtc) * TOLERANCE_PERCENT;
+    
+    ticket.quantity = memberAmount;
+    ticket.amountUsd = totalUsd;
+    ticket.amountLtc = totalLtc;
+    ticket.minLtc = parseFloat(totalLtc) - toleranceLtc;
+    ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc;
+    ticket.status = 'awaiting_payment';
+    ticket.paid = false;
+    ticket.delivered = false;
+    
+    console.log(`[AWAITING-MEMBERS] ${ticket.address} | ${memberAmount} members | $${totalUsd.toFixed(2)} | ${totalLtc} LTC`);
+    
+    await interaction.reply({ 
+      embeds: [new EmbedBuilder()
+        .setTitle('💳 Payment - Members Order')
+        .setDescription(`**${ticket.productName}**\n**Amount:** ${memberAmount.toLocaleString()} members\n**Rate:** $${ticket.price} per ${ticket.unit}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
         .addFields(
           { name: '📋 LTC Address', value: `\`${ticket.address}\`` },
           { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
@@ -563,8 +634,8 @@ async function processPayment(channelId, receivedLtc) {
   if (owner) {
     owner.send({
       embeds: [new EmbedBuilder()
-        .setTitle('🛒 New Nitro Order')
-        .setDescription(`**Product:** ${ticket.productName}\n**Quantity:** ${ticket.quantity}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**Received:** ${receivedLtc.toFixed(8)} LTC\n**Channel:** <#${channelId}>`)
+        .setTitle('🛒 New Order')
+        .setDescription(`**Product:** ${ticket.productName}\n**Quantity:** ${ticket.quantity.toLocaleString()}${ticket.productType === 'calculated' ? ' members' : ''}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**Received:** ${receivedLtc.toFixed(8)} LTC\n**Channel:** <#${channelId}>`)
         .setColor(0x00FF00)
         .setTimestamp()
       ]
@@ -581,6 +652,45 @@ async function deliverProducts(channelId, receivedLtc) {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
   
+  // Handle calculated products (Members) differently
+  if (ticket.productType === 'calculated') {
+    ticket.delivered = true;
+    
+    if (settings.saleChannel) {
+      const ch = client.channels.cache.get(settings.saleChannel);
+      if (ch) {
+        ch.send({
+          embeds: [new EmbedBuilder()
+            .setTitle('💰 New Members Order')
+            .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\n**Total:** $${ticket.amountUsd.toFixed(2)}`)
+            .setColor(0x00FF00)
+            .setTimestamp()
+          ]
+        }).catch(() => {});
+      }
+    }
+    
+    await channel.send({
+      embeds: [new EmbedBuilder()
+        .setTitle('🎁 Members Order Confirmed')
+        .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\n**Paid:** ${receivedLtc.toFixed(8)} LTC\n\nThe owner has been notified and will deliver your members shortly.`)
+        .setColor(0x00FF00)
+      ]
+    });
+    
+    await channel.send({
+      embeds: [new EmbedBuilder()
+        .setTitle('🙏 Please Vouch')
+        .setDescription(`Copy & paste:\n\`vouch <@${OWNER_ID}> ${ticket.productName} ${ticket.quantity.toLocaleString()} members $${ticket.amountUsd.toFixed(2)}\``)
+        .setColor(0x5865F2)
+      ]
+    });
+    
+    console.log(`[DELIVERED-MEMBERS] Channel ${channelId} - ${ticket.quantity.toLocaleString()} members`);
+    return;
+  }
+  
+  // Standard product delivery
   const productList = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
   
   if (productList.length === 0) {
