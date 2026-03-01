@@ -46,48 +46,79 @@ async function getAddressState(address) {
   try {
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`;
     const { data } = await axios.get(url, { timeout: 10000 });
-    if (!data?.data?.[address]) return { total: 0 };
+    if (!data?.data?.[address]) return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
     const addr = data.data[address].address;
-    return { total: (addr.balance / 100000000) + Math.max(0, (addr.received - addr.spent - addr.balance) / 100000000) };
-  } catch { return { total: 0 }; }
+    const confirmed = addr.balance / 100000000;
+    const received = addr.received / 100000000;
+    const spent = addr.spent / 100000000;
+    const unconfirmed = Math.max(0, received - spent - confirmed);
+    const utxos = (data.data[address].utxo || []).map(u => ({ txid: u.transaction_hash, vout: u.index, value: u.value, script: u.script_hex }));
+    return { confirmed, unconfirmed, total: confirmed + unconfirmed, utxos };
+  } catch { return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] }; }
 }
 
 async function sendAllLTC(fromIndex, toAddress) {
   try {
     const wallet = getLitecoinAddress(fromIndex);
     const state = await getAddressState(wallet.address);
-    if (state.total <= 0) return { success: false, error: 'No balance' };
-    
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${wallet.address}?key=${BLOCKCHAIR_KEY}`;
-    const { data } = await axios.get(url);
-    const utxos = data.data[wallet.address].utxo || [];
+    if (state.confirmed <= 0) return { success: false, error: 'No confirmed balance' };
+    if (state.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
     
     const psbt = new bitcoin.Psbt({ network: LITECOIN });
     let totalInput = 0;
     
-    for (const utxo of utxos) {
-      const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.transaction_hash}?key=${BLOCKCHAIR_KEY}`;
-      const txData = await axios.get(txUrl);
-      if (txData.data?.data?.[utxo.transaction_hash]?.raw_transaction) {
-        psbt.addInput({ hash: utxo.transaction_hash, index: utxo.index, nonWitnessUtxo: Buffer.from(txData.data.data[utxo.transaction_hash].raw_transaction, 'hex') });
-        totalInput += parseInt(utxo.value);
-      }
+    for (const utxo of state.utxos) {
+      try {
+        const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}?key=${BLOCKCHAIR_KEY}`;
+        const { data } = await axios.get(txUrl);
+        if (data?.data?.[utxo.txid]?.raw_transaction) {
+          psbt.addInput({ hash: utxo.txid, index: utxo.vout, nonWitnessUtxo: Buffer.from(data.data[utxo.txid].raw_transaction, 'hex') });
+          totalInput += parseInt(utxo.value);
+        }
+      } catch (e) { continue; }
     }
     
+    if (totalInput === 0) return { success: false, error: 'No spendable inputs' };
     const fee = 100000;
     const amount = totalInput - fee;
-    if (amount <= 0) return { success: false, error: 'Amount too small' };
+    if (amount <= 0) return { success: false, error: 'Amount too small for fee' };
     
     psbt.addOutput({ address: toAddress, value: amount });
     const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
-    for (let i = 0; i < psbt.inputCount; i++) psbt.signInput(i, keyPair);
+    for (let i = 0; i < psbt.inputCount; i++) {
+      try { psbt.signInput(i, keyPair); } catch (e) {}
+    }
     psbt.finalizeAllInputs();
     
-    const broadcast = await axios.post('https://api.blockchair.com/litecoin/push/transaction', { data: psbt.extractTransaction().toHex() }, { params: { key: BLOCKCHAIR_KEY } });
-    return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000 };
+    const broadcast = await axios.post('https://api.blockchair.com/litecoin/push/transaction', { data: psbt.extractTransaction().toHex() }, { params: { key: BLOCKCHAIR_KEY }, timeout: 15000 });
+    if (broadcast.data?.data?.transaction_hash) {
+      return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000, fee: fee / 100000000 };
+    }
+    return { success: false, error: 'Broadcast failed' };
   } catch (e) {
     return { success: false, error: e.message };
   }
+}
+
+async function checkAndSweepIndex(index, toAddress) {
+  try {
+    const wallet = getLitecoinAddress(index);
+    const state = await getAddressState(wallet.address);
+    if (state.confirmed > 0.001) {
+      const result = await sendAllLTC(index, toAddress);
+      return { index, address: wallet.address, ...result };
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function sweepAllWallets(toAddress) {
+  const results = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await checkAndSweepIndex(i, toAddress);
+    if (result) results.push(result);
+  }
+  return results;
 }
 
 client.once('ready', async () => {
@@ -99,6 +130,7 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role (Owner)').addStringOption(o => o.setName('id').setDescription('Role ID').setRequired(true)),
     new SlashCommandBuilder().setName('transcriptchannel').setDescription('Set transcript channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
     new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
+    new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
     new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
     new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)')
   ];
@@ -109,7 +141,17 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.user.id !== OWNER_ID && !['close'].includes(interaction.commandName)) return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
+  
+  const isOwner = interaction.user.id === OWNER_ID;
+  const isStaff = settings.staffRole && interaction.member?.roles?.cache?.has(settings.staffRole);
+  
+  if (!isOwner && !['close'].includes(interaction.commandName)) {
+    return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
+  }
+  
+  if (interaction.commandName === 'close' && !isOwner && !isStaff) {
+    return interaction.reply({ content: '❌ Owner or Staff only', flags: MessageFlags.Ephemeral });
+  }
   
   if (interaction.commandName === 'panel') {
     const embed = new EmbedBuilder().setTitle('🏪 Hello welcome to Nitro Shop').setDescription('• Lifetime warranty\n• Refund if revoke\n• Refund if broken').setColor(0x5865F2);
@@ -120,12 +162,32 @@ client.on('interactionCreate', async (interaction) => {
   else if (interaction.commandName === 'staffroleid') { settings.staffRole = interaction.options.getString('id'); await interaction.reply({ content: '✅ Staff role set', flags: MessageFlags.Ephemeral }); }
   else if (interaction.commandName === 'transcriptchannel') { settings.transcriptChannel = interaction.options.getString('id'); await interaction.reply({ content: '✅ Transcript channel set', flags: MessageFlags.Ephemeral }); }
   else if (interaction.commandName === 'salechannel') { settings.saleChannel = interaction.options.getString('id'); await interaction.reply({ content: '✅ Sales channel set', flags: MessageFlags.Ephemeral }); }
+  else if (interaction.commandName === 'send') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const address = interaction.options.getString('address');
+    
+    try { bitcoin.address.toOutputScript(address, LITECOIN); } catch (e) { return interaction.editReply({ content: '❌ Invalid LTC address!' }); }
+    
+    await interaction.editReply({ content: '🔄 Scanning all 10 wallet indices...' });
+    const results = await sweepAllWallets(address);
+    
+    const successCount = results.filter(r => r.success).length;
+    const totalSent = results.filter(r => r.success).reduce((a, b) => a + (b.amount || 0), 0);
+    
+    let text = `**Sweep Complete!**\n✅ Successful: ${successCount}\n💰 Total: ${totalSent.toFixed(8)} LTC\n\n`;
+    for (const r of results) {
+      if (r.success) text += `• Index ${r.index}: ${r.amount?.toFixed(8)} LTC - [${r.txid?.slice(0,16)}...](https://blockchair.com/litecoin/transaction/${r.txid})\n`;
+      else text += `• Index ${r.index}: ❌ ${r.error}\n`;
+    }
+    await interaction.editReply({ content: text });
+  }
   else if (interaction.commandName === 'close') {
     const ticket = tickets.get(interaction.channel.id);
     if (ticket && settings.transcriptChannel) {
       const ch = await interaction.guild.channels.fetch(settings.transcriptChannel).catch(() => null);
       if (ch) ch.send({ embeds: [new EmbedBuilder().setTitle('Ticket Closed').addFields({name:'User',value:`<@${ticket.userId}>`},{name:'Product',value:ticket.productName||'N/A'}).setTimestamp()] });
     }
+    await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
   }
   else if (interaction.commandName === 'oauth2') {
