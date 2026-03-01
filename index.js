@@ -14,7 +14,6 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 const OWNER_ID = '1459833646130401429';
 const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
-const BLOCKCHAIR_KEY = process.env.BLOCKCHAIR_KEY;
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
 const TOLERANCE_PERCENT = 0.50;
 
@@ -38,7 +37,7 @@ const PRODUCTS = {
   nitro_boost_year: { name: 'Nitro Boost Yearly', price: 14.0, stock: ['link1','link2'] },
   members_offline: { name: 'Members (Offline)', price: 0.7, unit: 1000, type: 'calculated' },
   members_online: { name: 'Members (Online)', price: 1.5, unit: 1000, type: 'calculated' }
-];
+};
 
 function getLitecoinAddress(index, addressType = 'p2pkh') {
   const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
@@ -69,47 +68,73 @@ function releaseAddress(channelId) {
   return false;
 }
 
-// ============ API FALLBACKS ============
+// ============ 3XPL SANDBOX API (PRIMARY) ============
+// Base: https://sandbox-api.3xpl.com (no API key, rate limited)
 
-// API 1: Blockchair (with rate limit detection)
-async function checkBlockchairBalance(address) {
+async function check3xplBalance(address) {
   try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
-    const params = BLOCKCHAIR_KEY ? { key: BLOCKCHAIR_KEY } : {};
-    const { data } = await axios.get(url, { params, timeout: 15000 });
+    // 3xpl sandbox endpoint for Litecoin address
+    const url = `https://sandbox-api.3xpl.com/ltc/address/${address}`;
+    console.log(`[3XPL] Checking: ${address}`);
     
-    let addrData = null;
-    if (data?.data) {
-      for (const key of Object.keys(data.data)) {
-        if (key.toLowerCase() === address.toLowerCase()) {
-          addrData = data.data[key];
-          break;
-        }
-      }
+    const { data } = await axios.get(url, { timeout: 15000 });
+    
+    // Check context code
+    if (data.context?.code !== 200) {
+      console.log(`[3XPL] Error code: ${data.context?.code}`);
+      return { success: false, error: `API error: ${data.context?.code}` };
     }
     
-    if (addrData?.address) {
-      const addr = addrData.address;
-      const balance = (addr.balance || 0) / 100000000;
-      const received = (addr.received || 0) / 100000000;
-      const spent = (addr.spent || 0) / 100000000;
-      const unconfirmed = Math.max(0, received - spent - balance);
-      const utxos = (addrData.utxo || []).map(u => ({
-        txid: u.transaction_hash, vout: u.index, value: parseInt(u.value),
-        script: u.script_hex, type: u.script_hex?.startsWith('0014') ? 'bech32' : 'legacy'
-      }));
-      return { success: true, confirmed: balance, unconfirmed, total: balance + unconfirmed, utxos, source: 'blockchair' };
+    if (data.data) {
+      // Parse balance from 3xpl format
+      const balanceData = data.data;
+      
+      // Balance is usually in satoshis
+      const confirmed = parseInt(balanceData.balance?.confirmed || balanceData.confirmed || 0) / 100000000;
+      const unconfirmed = parseInt(balanceData.balance?.unconfirmed || balanceData.unconfirmed || 0) / 100000000;
+      const total = confirmed + unconfirmed;
+      
+      console.log(`[3XPL] ✅ ${address}: ${total.toFixed(8)} LTC`);
+      return { success: true, confirmed, unconfirmed, total, utxos: [], source: '3xpl' };
     }
     return { success: false, error: 'No data' };
   } catch (error) {
-    if (error.response?.status === 429 || error.response?.status === 432) {
-      return { success: false, error: 'rate_limited' };
+    console.log(`[3XPL ERROR] ${error.response?.status || error.message}`);
+    if (error.response?.data) {
+      console.log(`[3XPL ERROR] Response:`, error.response.data);
     }
     return { success: false, error: error.message };
   }
 }
 
-// API 2: SoChain (MOST RELIABLE - no key needed)
+// Get UTXOs from 3xpl
+async function get3xplUTXOs(address) {
+  try {
+    const url = `https://sandbox-api.3xpl.com/ltc/address/${address}/utxos`;
+    const { data } = await axios.get(url, { timeout: 15000 });
+    
+    if (data.context?.code !== 200) {
+      return [];
+    }
+    
+    if (data.data && Array.isArray(data.data)) {
+      return data.data.map(u => ({
+        txid: u.txid || u.transaction_hash,
+        vout: u.vout || u.index,
+        value: parseInt(u.value),
+        script: u.script || u.script_hex,
+        type: (u.script || u.script_hex)?.startsWith('0014') ? 'bech32' : 'legacy'
+      }));
+    }
+    return [];
+  } catch (error) {
+    console.log(`[3XPL UTXO ERROR] ${error.message}`);
+    return [];
+  }
+}
+
+// ============ FALLBACK APIs ============
+
 async function checkSoChainBalance(address) {
   try {
     const url = `https://chain.so/api/v2/get_address_balance/LTC/${address}`;
@@ -125,7 +150,6 @@ async function checkSoChainBalance(address) {
   }
 }
 
-// API 3: Litecoinspace (no key needed)
 async function checkLitecoinspaceBalance(address) {
   try {
     const url = `https://litecoinspace.org/api/address/${address}`;
@@ -141,15 +165,13 @@ async function checkLitecoinspaceBalance(address) {
   }
 }
 
-// MASTER: Try all APIs in order
+// MASTER: Try 3xpl first, then fallbacks
 async function checkAddressBalance(address) {
-  // Try Blockchair first
-  if (BLOCKCHAIR_KEY) {
-    const blockchair = await checkBlockchairBalance(address);
-    if (blockchair.success) return blockchair;
-  }
+  // Try 3xpl sandbox first (free, no key)
+  const xpl = await check3xplBalance(address);
+  if (xpl.success) return xpl;
   
-  // Fallback to SoChain (works without API key)
+  // Fallback to SoChain
   const sochain = await checkSoChainBalance(address);
   if (sochain.success) return sochain;
   
@@ -161,23 +183,26 @@ async function checkAddressBalance(address) {
 }
 
 async function getUTXOs(address) {
+  // Try 3xpl first
+  const utxos = await get3xplUTXOs(address);
+  if (utxos.length > 0) return utxos;
+  
+  // Fallback to litecoinspace
   try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true`;
-    const params = BLOCKCHAIR_KEY ? { key: BLOCKCHAIR_KEY } : {};
-    const { data } = await axios.get(url, { params, timeout: 15000 });
-    for (const key of Object.keys(data?.data || {})) {
-      if (key.toLowerCase() === address.toLowerCase()) {
-        const addrData = data.data[key];
-        if (addrData?.utxo) {
-          return addrData.utxo.map(u => ({
-            txid: u.transaction_hash, vout: u.index, value: parseInt(u.value),
-            script: u.script_hex, type: u.script_hex?.startsWith('0014') ? 'bech32' : 'legacy'
-          }));
-        }
-      }
+    const url = `https://litecoinspace.org/api/address/${address}/utxo`;
+    const { data } = await axios.get(url, { timeout: 15000 });
+    if (Array.isArray(data)) {
+      return data.map(u => ({
+        txid: u.txid,
+        vout: u.vout,
+        value: u.value,
+        script: u.scriptpubkey,
+        type: u.scriptpubkey?.startsWith('0014') ? 'bech32' : 'legacy'
+      }));
     }
-    return [];
-  } catch (error) { return []; }
+  } catch (e) {}
+  
+  return [];
 }
 
 async function getAddressState(addressIndex) {
@@ -204,11 +229,12 @@ async function sendAllLTC(fromIndex, toAddress) {
     
     for (const utxo of state.utxos) {
       try {
-        const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}`;
-        const params = BLOCKCHAIR_KEY ? { key: BLOCKCHAIR_KEY } : {};
-        const { data } = await axios.get(txUrl, { params, timeout: 10000 });
-        if (data?.data?.[utxo.txid]?.raw_transaction) {
-          const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
+        // Get raw tx from 3xpl
+        const txUrl = `https://sandbox-api.3xpl.com/ltc/transaction/${utxo.txid}`;
+        const { data } = await axios.get(txUrl, { timeout: 10000 });
+        
+        if (data.context?.code === 200 && data.data?.hex) {
+          const rawTx = Buffer.from(data.data.hex, 'hex');
           if (utxo.type === 'bech32') {
             psbt.addInput({ hash: utxo.txid, index: utxo.vout, witnessUtxo: { script: Buffer.from(utxo.script, 'hex'), value: utxo.value } });
           } else {
@@ -230,12 +256,12 @@ async function sendAllLTC(fromIndex, toAddress) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
     
-    const broadcastUrl = `https://api.blockchair.com/litecoin/push/transaction`;
-    const broadcastParams = BLOCKCHAIR_KEY ? { key: BLOCKCHAIR_KEY } : {};
-    const broadcast = await axios.post(broadcastUrl, { data: txHex }, { params: broadcastParams, timeout: 15000 });
+    // Broadcast via 3xpl
+    const broadcast = await axios.post('https://sandbox-api.3xpl.com/ltc/push', { tx: txHex }, { timeout: 15000 });
     
-    if (broadcast.data?.data?.transaction_hash) {
-      return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000, fee: fee / 100000000 };
+    if (broadcast.data?.data?.txid || broadcast.data?.data) {
+      const txid = broadcast.data.data.txid || broadcast.data.data;
+      return { success: true, txid, amount: amount / 100000000, fee: fee / 100000000 };
     }
     return { success: false, error: 'Broadcast failed' };
   } catch (error) {
@@ -247,7 +273,7 @@ async function sendAllLTC(fromIndex, toAddress) {
 
 client.once('ready', async () => {
   console.log(`[READY] Bot: ${client.user.tag}`);
-  console.log('[INIT] Checking balances (using fallback APIs if needed)...');
+  console.log('[INIT] Checking balances via 3xpl sandbox...');
   
   for (let addr of ADDRESSES) {
     const state = await checkAddressBalance(addr.address);
@@ -295,7 +321,7 @@ client.on('interactionCreate', async (interaction) => {
     let text = '**3-Address Status:**\n\n';
     for (let addr of ADDRESSES) {
       const state = await checkAddressBalance(addr.address);
-      text += `**[${addr.index}]** \\`${addr.address}\\`\n`;
+      text += `**[${addr.index}]** \`${addr.address}\`\n`;
       text += `Balance: **${state.total.toFixed(8)} LTC** ($${(state.total * ltcPrice).toFixed(2)})\n`;
       text += `API: ${state.source || '❌'}\n\n`;
     }
@@ -307,7 +333,7 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.reply({
       embeds: [new EmbedBuilder()
         .setTitle(`💰 Wallet ${idx}`)
-        .setDescription(`**Address:** \\`${state.address}\\`\n**Total:** ${state.total.toFixed(8)} LTC ($${(state.total * ltcPrice).toFixed(2)})\n**API:** ${state.source || '❌'}`)
+        .setDescription(`**Address:** \`${state.address}\`\n**Total:** ${state.total.toFixed(8)} LTC ($${(state.total * ltcPrice).toFixed(2)})\n**API:** ${state.source || '❌'}`)
         .setColor(state.total > 0 ? 0x00FF00 : 0xFF0000)
       ],
       flags: MessageFlags.Ephemeral
