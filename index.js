@@ -187,6 +187,10 @@ client.on('interactionCreate', async (interaction) => {
       const ch = await interaction.guild.channels.fetch(settings.transcriptChannel).catch(() => null);
       if (ch) ch.send({ embeds: [new EmbedBuilder().setTitle('Ticket Closed').addFields({name:'User',value:`<@${ticket.userId}>`},{name:'Product',value:ticket.productName||'N/A'}).setTimestamp()] });
     }
+    
+    // DELETE TICKET FROM MAP BEFORE CLOSING CHANNEL
+    tickets.delete(interaction.channel.id);
+    
     await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
   }
@@ -201,8 +205,19 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
     if (!settings.ticketCategory) return interaction.reply({ content: '❌ Not setup', flags: MessageFlags.Ephemeral });
     
-    const existing = Array.from(tickets.values()).find(t => t.userId === interaction.user.id && t.status !== 'delivered');
-    if (existing) return interaction.reply({ content: '❌ Already have ticket', flags: MessageFlags.Ephemeral });
+    // CHECK IF CHANNEL ACTUALLY EXISTS - not just if ticket is in map
+    const existingTicket = Array.from(tickets.entries()).find(([_, t]) => t.userId === interaction.user.id && t.status !== 'delivered');
+    if (existingTicket) {
+      const [channelId, ticketData] = existingTicket;
+      // Check if channel still exists
+      const existingChannel = interaction.guild.channels.cache.get(channelId);
+      if (existingChannel) {
+        return interaction.reply({ content: `❌ You already have an open ticket: ${existingChannel}`, flags: MessageFlags.Ephemeral });
+      } else {
+        // Channel was deleted but ticket still in map - clean it up
+        tickets.delete(channelId);
+      }
+    }
     
     const channel = await interaction.guild.channels.create({
       name: `nitro-${interaction.user.username}`,
@@ -267,12 +282,17 @@ async function checkPayments() {
   const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment');
   
   for (const [channelId, ticket] of awaiting) {
+    // Check if channel still exists before processing
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      tickets.delete(channelId); // Clean up orphaned tickets
+      continue;
+    }
+    
     const state = await getAddressState(ticket.address);
     
     if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
       ticket.status = 'delivered';
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel) continue;
       
       await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
       
