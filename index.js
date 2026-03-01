@@ -22,9 +22,9 @@ const LITECOIN = { messagePrefix: '\x19Litecoin Signed Message:\n', bech32: 'ltc
 
 // EXACTLY 3 ADDRESSES WITH YOUR MONEY
 const ADDRESSES = [
-  { index: 0, address: 'Lc1m5wtQ8g9mJJP9cV1Db3S7DCxuot98CU', inUse: false, ticketChannel: null }, // 2.8$
-  { index: 1, address: 'LPtT2PJ9V2h2cJR6qAz8RSAVKpSHoLodQg', inUse: false, ticketChannel: null }, // 1$
-  { index: 2, address: null, inUse: false, ticketChannel: null }
+  { index: 0, address: 'Lc1m5wtQ8g9mJJP9cV1Db3S7DCxuot98CU', inUse: false, ticketChannel: null, type: 'bech32' },
+  { index: 1, address: 'LPtT2PJ9V2h2cJR6qAz8RSAVKpSHoLodQg', inUse: false, ticketChannel: null, type: 'p2pkh' },
+  { index: 2, address: null, inUse: false, ticketChannel: null, type: 'p2pkh' }
 ];
 
 let ltcPrice = 75;
@@ -41,18 +41,25 @@ const PRODUCTS = {
   members_online: { name: 'Members (Online)', price: 1.5, unit: 1000, type: 'calculated' }
 };
 
-function getLitecoinAddress(index) {
+function getLitecoinAddress(index, addressType = 'p2pkh') {
   const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
   const root = bip32.fromSeed(seed, LITECOIN);
   const child = root.derivePath(`m/44'/2'/0'/0/${index}`);
   const pubkey = Buffer.from(child.publicKey);
-  const legacy = bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
+  
+  let payment;
+  if (addressType === 'bech32') {
+    payment = bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN });
+  } else {
+    payment = bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
+  }
+  
   const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
-  return { address: legacy.address, privateKey: keyPair.toWIF(), index: index };
+  return { address: payment.address, privateKey: keyPair.toWIF(), index: index, type: addressType };
 }
 
-// Initialize address 2
-const wallet2 = getLitecoinAddress(2);
+// Initialize address 2 (P2PKH)
+const wallet2 = getLitecoinAddress(2, 'p2pkh');
 ADDRESSES[2].address = wallet2.address;
 
 function getAvailableAddress() {
@@ -74,32 +81,58 @@ function releaseAddress(channelId) {
   return false;
 }
 
+// Find address data in Blockchair response (case-insensitive)
+function findAddressInResponse(data, address) {
+  if (!data || !data.data) return null;
+  
+  // Try exact match first
+  if (data.data[address]) return data.data[address];
+  
+  // Try lowercase
+  const lowerAddr = address.toLowerCase();
+  if (data.data[lowerAddr]) return data.data[lowerAddr];
+  
+  // Try uppercase
+  const upperAddr = address.toUpperCase();
+  if (data.data[upperAddr]) return data.data[upperAddr];
+  
+  // Iterate through keys to find case-insensitive match
+  for (const key of Object.keys(data.data)) {
+    if (key.toLowerCase() === lowerAddr) {
+      return data.data[key];
+    }
+  }
+  
+  return null;
+}
+
 // PRIMARY: Blockchair API with your key
 async function checkBlockchairBalance(address) {
   try {
-    // Try lowercase version first (Blockchair prefers lowercase bech32)
-    const checkAddress = address.toLowerCase().startsWith('lc1') ? address.toLowerCase() : address;
-    
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${checkAddress}?key=${BLOCKCHAIR_KEY}`;
-    console.log(`[BLOCKCHAIR] Checking: ${checkAddress}`);
+    // Use original casing for API call - Blockchair handles both
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`;
+    console.log(`[BLOCKCHAIR] Checking: ${address}`);
     
     const { data } = await axios.get(url, { timeout: 15000 });
     
-    if (data?.data?.[checkAddress]) {
-      const addr = data.data[checkAddress].address;
+    const addrData = findAddressInResponse(data, address);
+    
+    if (addrData && addrData.address) {
+      const addr = addrData.address;
       const balance = (addr.balance || 0) / 100000000;
       const received = (addr.received || 0) / 100000000;
       const spent = (addr.spent || 0) / 100000000;
       const unconfirmed = Math.max(0, received - spent - balance);
       
-      const utxos = (data.data[checkAddress].utxo || []).map(u => ({
+      const utxos = (addrData.utxo || []).map(u => ({
         txid: u.transaction_hash,
         vout: u.index,
         value: parseInt(u.value),
-        script: u.script_hex
+        script: u.script_hex,
+        type: u.script_hex?.startsWith('0014') ? 'bech32' : 'legacy'
       }));
       
-      console.log(`[BLOCKCHAIR] ${checkAddress}: ${balance.toFixed(8)} LTC`);
+      console.log(`[BLOCKCHAIR] ${address}: ${balance.toFixed(8)} LTC confirmed, ${unconfirmed.toFixed(8)} unconfirmed`);
       
       return { 
         success: true, 
@@ -107,20 +140,25 @@ async function checkBlockchairBalance(address) {
         unconfirmed: unconfirmed,
         total: balance + unconfirmed,
         utxos: utxos,
-        address: checkAddress
+        address: address
       };
     }
-    return { success: false, error: 'No data' };
+    console.log(`[BLOCKCHAIR] No data found for ${address}`);
+    return { success: false, error: 'No data', raw: data };
   } catch (error) {
     console.log(`[BLOCKCHAIR ERROR] ${address}: ${error.message}`);
+    if (error.response) {
+      console.log(`[BLOCKCHAIR ERROR] Status: ${error.response.status}, Data:`, error.response.data);
+    }
     return { success: false, error: error.message };
   }
 }
 
-// FALLBACK: SoChain API (more reliable for Litecoin)
+// FALLBACK: SoChain API (FIXED URL)
 async function checkSoChainBalance(address) {
   try {
-    const url = `https://chain.so/api/v3/balance/LTC/${address}`;
+    // SoChain v2 API (v3 doesn't exist)
+    const url = `https://chain.so/api/v2/get_address_balance/LTC/${address}`;
     console.log(`[SOCHAIN] Checking: ${address}`);
     
     const { data } = await axios.get(url, { timeout: 15000 });
@@ -131,37 +169,38 @@ async function checkSoChainBalance(address) {
       
       console.log(`[SOCHAIN] ${address}: ${confirmed.toFixed(8)} LTC`);
       
-      // SoChain doesn't give UTXOs, just balance
       return {
         success: true,
         confirmed: confirmed,
         unconfirmed: unconfirmed,
         total: confirmed + unconfirmed,
-        utxos: [], // Will need separate UTXO fetch for sending
+        utxos: [],
         address: address
       };
     }
-    return { success: false, error: 'No data' };
+    return { success: false, error: 'No data', raw: data };
   } catch (error) {
     console.log(`[SOCHAIN ERROR] ${address}: ${error.message}`);
     return { success: false, error: error.message };
   }
 }
 
-// Get UTXOs from Blockchair for sending (fallback needed if SoChain used for balance)
+// Get UTXOs from Blockchair for sending
 async function getUTXOs(address) {
   try {
-    const checkAddress = address.toLowerCase().startsWith('lc1') ? address.toLowerCase() : address;
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${checkAddress}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
     
     const { data } = await axios.get(url, { timeout: 15000 });
     
-    if (data?.data?.[checkAddress]?.utxo) {
-      return data.data[checkAddress].utxo.map(u => ({
+    const addrData = findAddressInResponse(data, address);
+    
+    if (addrData?.utxo) {
+      return addrData.utxo.map(u => ({
         txid: u.transaction_hash,
         vout: u.index,
         value: parseInt(u.value),
-        script: u.script_hex
+        script: u.script_hex,
+        type: u.script_hex?.startsWith('0014') ? 'bech32' : 'legacy'
       }));
     }
     return [];
@@ -200,7 +239,7 @@ async function getAddressState(addressIndex) {
   if (!addrInfo) return { confirmed: 0, unconfirmed: 0, total: 0, utxos: [], address: null };
   
   const state = await checkAddressBalance(addrInfo.address);
-  const wallet = getLitecoinAddress(addressIndex);
+  const wallet = getLitecoinAddress(addressIndex, addrInfo.type);
   
   return {
     confirmed: state.confirmed || 0,
@@ -209,7 +248,8 @@ async function getAddressState(addressIndex) {
     utxos: state.utxos || [],
     address: addrInfo.address,
     privateKey: wallet.privateKey,
-    addressIndex: addressIndex
+    addressIndex: addressIndex,
+    type: addrInfo.type
   };
 }
 
@@ -217,7 +257,7 @@ async function sendAllLTC(fromIndex, toAddress) {
   try {
     const state = await getAddressState(fromIndex);
     
-    console.log(`[SEND] Index ${fromIndex} (${state.address}): ${state.total.toFixed(8)} LTC, ${state.utxos.length} UTXOs`);
+    console.log(`[SEND] Index ${fromIndex} (${state.address}): ${state.total.toFixed(8)} LTC, ${state.utxos.length} UTXOs, type: ${state.type}`);
     
     if (state.total <= 0.0001) {
       return { success: false, error: `No balance on index ${fromIndex}` };
@@ -241,7 +281,25 @@ async function sendAllLTC(fromIndex, toAddress) {
         
         if (data?.data?.[utxo.txid]?.raw_transaction) {
           const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
-          psbt.addInput({ hash: utxo.txid, index: utxo.vout, nonWitnessUtxo: rawTx });
+          
+          if (utxo.type === 'bech32' || state.type === 'bech32') {
+            // For SegWit (bech32), use witnessUtxo
+            psbt.addInput({
+              hash: utxo.txid,
+              index: utxo.vout,
+              witnessUtxo: {
+                script: Buffer.from(utxo.script, 'hex'),
+                value: utxo.value
+              }
+            });
+          } else {
+            // For legacy, use nonWitnessUtxo
+            psbt.addInput({
+              hash: utxo.txid,
+              index: utxo.vout,
+              nonWitnessUtxo: rawTx
+            });
+          }
           totalInput += utxo.value;
           console.log(`[SEND] Added input: ${utxo.txid.slice(0,16)}... value: ${utxo.value}`);
         }
@@ -261,12 +319,17 @@ async function sendAllLTC(fromIndex, toAddress) {
     
     const keyPair = ECPair.fromWIF(state.privateKey, LITECOIN);
     for (let i = 0; i < psbt.inputCount; i++) {
-      try { psbt.signInput(i, keyPair); } catch (e) {}
+      try { 
+        psbt.signInput(i, keyPair); 
+      } catch (e) {
+        console.log(`[SEND] Sign error for input ${i}: ${e.message}`);
+      }
     }
     
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
     
+    console.log(`[SEND] Broadcasting transaction...`);
     const broadcast = await axios.post(
       `https://api.blockchair.com/litecoin/push/transaction?key=${BLOCKCHAIR_KEY}`,
       { data: txHex },
@@ -274,6 +337,7 @@ async function sendAllLTC(fromIndex, toAddress) {
     );
     
     if (broadcast.data?.data?.transaction_hash) {
+      console.log(`[SEND] Success! TX: ${broadcast.data.data.transaction_hash}`);
       return {
         success: true,
         txid: broadcast.data.data.transaction_hash,
@@ -282,6 +346,7 @@ async function sendAllLTC(fromIndex, toAddress) {
         fromAddress: state.address
       };
     } else {
+      console.log(`[SEND] Broadcast failed:`, broadcast.data);
       return { success: false, error: 'Broadcast failed', details: broadcast.data };
     }
   } catch (error) {
@@ -296,8 +361,9 @@ client.once('ready', async () => {
   
   for (let addr of ADDRESSES) {
     const state = await checkAddressBalance(addr.address);
-    console.log(`  [${addr.index}] ${addr.address}`);
-    console.log(`       Balance: ${state.total.toFixed(8)} LTC (Blockchair: ${state.success ? 'OK' : 'FAIL'})`);
+    console.log(`  [${addr.index}] ${addr.address} (${addr.type})`);
+    console.log(`       Balance: ${state.total.toFixed(8)} LTC (${(state.total * ltcPrice).toFixed(2)} USD)`);
+    console.log(`       Status: ${state.success ? '✅ API OK' : '❌ API FAIL'}`);
   }
   
   const commands = [
@@ -313,7 +379,8 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('check').setDescription('Manually check payment status (Owner)'),
     new SlashCommandBuilder().setName('forcepay').setDescription('Force mark as paid and deliver (Owner)'),
     new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)'),
-    new SlashCommandBuilder().setName('status').setDescription('Show address status (Owner)')
+    new SlashCommandBuilder().setName('status').setDescription('Show address status (Owner)'),
+    new SlashCommandBuilder().setName('debug').setDescription('Debug API response for address (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-2').setRequired(true))
   ];
   
   await client.application.commands.set(commands);
@@ -349,12 +416,44 @@ client.on('interactionCreate', async (interaction) => {
     );
     await interaction.reply({ embeds: [embed], components: [row] });
   }
+  else if (interaction.commandName === 'debug') {
+    const idx = interaction.options.getInteger('index');
+    if (idx < 0 || idx > 2) return interaction.reply({ content: '❌ Index 0-2 only', flags: MessageFlags.Ephemeral });
+    
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const addrInfo = ADDRESSES.find(a => a.index === idx);
+    
+    // Raw API call to see what's happening
+    try {
+      const url = `https://api.blockchair.com/litecoin/dashboards/address/${addrInfo.address}?key=${BLOCKCHAIR_KEY}`;
+      const { data } = await axios.get(url, { timeout: 15000 });
+      
+      const addrData = findAddressInResponse(data, addrInfo.address);
+      
+      let debugText = `**Debug for Address [${idx}]:** \`${addrInfo.address}\`\n\n`;
+      debugText += `**API Response Keys:** ${Object.keys(data.data || {}).join(', ')}\n\n`;
+      
+      if (addrData) {
+        debugText += `**Found Address Data:** ✅\n`;
+        debugText += `Balance (satoshis): ${addrData.address?.balance || 0}\n`;
+        debugText += `Balance (LTC): ${((addrData.address?.balance || 0) / 100000000).toFixed(8)}\n`;
+        debugText += `UTXOs: ${(addrData.utxo || []).length}\n`;
+      } else {
+        debugText += `**Found Address Data:** ❌ Not found in response\n`;
+        debugText += `**Raw data keys:** ${JSON.stringify(Object.keys(data.data || {})).slice(0, 500)}`;
+      }
+      
+      await interaction.editReply({ content: debugText });
+    } catch (error) {
+      await interaction.editReply({ content: `**API Error:** ${error.message}` });
+    }
+  }
   else if (interaction.commandName === 'status') {
     let text = '**3-Address Status:**\n\n';
     for (let addr of ADDRESSES) {
       const state = await checkAddressBalance(addr.address);
-      text += `**[${addr.index}]** \`${addr.address}\`\n`;
-      text += `Balance: ${state.total.toFixed(8)} LTC\n`;
+      text += `**[${addr.index}]** \`${addr.address}\` (${addr.type})\n`;
+      text += `Balance: **${state.total.toFixed(8)} LTC** ($${(state.total * ltcPrice).toFixed(2)})\n`;
       text += `Status: ${addr.inUse ? `🔴 In Use (Ticket: ${addr.ticketChannel?.slice(0,8)}...)` : '🟢 Available'}\n\n`;
     }
     await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
@@ -389,17 +488,13 @@ client.on('interactionCreate', async (interaction) => {
     for (let i = 0; i <= 2; i++) {
       const result = await sendAllLTC(i, address);
       if (result.success) {
-        results.push(`✅ Index ${i}: Sent ${result.amount.toFixed(8)} LTC from ${result.fromAddress}`);
+        results.push(`✅ Index ${i}: Sent ${result.amount.toFixed(8)} LTC from ${result.fromAddress}\nTX: ${result.txid}`);
       } else {
-        console.log(`[SEND FAIL] Index ${i}: ${result.error}`);
+        results.push(`❌ Index ${i}: ${result.error}`);
       }
     }
     
-    if (results.length === 0) {
-      await interaction.editReply({ content: '❌ No funds sent. Check /status to see balances.' });
-    } else {
-      await interaction.editReply({ content: results.join('\n') });
-    }
+    await interaction.editReply({ content: results.join('\n\n') });
   }
   else if (interaction.commandName === 'balance') {
     const idx = interaction.options.getInteger('index');
@@ -411,7 +506,7 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.reply({
       embeds: [new EmbedBuilder()
         .setTitle(`💰 Wallet ${idx}`)
-        .setDescription(`**Address:** \`${state.address}\`\n**Confirmed:** ${state.confirmed.toFixed(8)} LTC\n**Unconfirmed:** ${state.unconfirmed.toFixed(8)} LTC\n**TOTAL:** ${state.total.toFixed(8)} LTC\n**Status:** ${addrInfo.inUse ? '🔴 In Use' : '🟢 Available'}`)
+        .setDescription(`**Address:** \`${state.address}\`\n**Type:** ${addrInfo.type}\n**Confirmed:** ${state.confirmed.toFixed(8)} LTC\n**Unconfirmed:** ${state.unconfirmed.toFixed(8)} LTC\n**TOTAL:** ${state.total.toFixed(8)} LTC ($${(state.total * ltcPrice).toFixed(2)})\n**Status:** ${addrInfo.inUse ? '🔴 In Use' : '🟢 Available'}`)
         .setColor(state.total > 0 ? 0x00FF00 : 0xFF0000)
       ],
       flags: MessageFlags.Ephemeral
@@ -427,18 +522,21 @@ client.on('interactionCreate', async (interaction) => {
     let text = `**Payment Check - Address [${ticket.walletIndex}]**\n`;
     text += `Address: \`${state.address}\`\n`;
     text += `Expected: ${ticket.amountLtc} LTC\n`;
-    text += `Detected: ${state.total.toFixed(8)} LTC\n`;
+    text += `Detected: **${state.total.toFixed(8)} LTC**\n`;
     text += `Min: ${ticket.minLtc?.toFixed(8)} / Max: ${ticket.maxLtc?.toFixed(8)}\n\n`;
     
     if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
-      text += `✅ **PAYMENT DETECTED!**`;
+      text += `✅ **PAYMENT DETECTED! Processing...**`;
       await interaction.editReply({ content: text });
       await processPayment(interaction.channel.id, state.total);
-    } else if (state.total > 0) {
-      text += `⚠️ Payment outside tolerance range`;
+    } else if (state.total > 0 && state.total < ticket.minLtc) {
+      text += `⚠️ Partial payment detected (${state.total.toFixed(8)} LTC). Need ${ticket.minLtc.toFixed(8)} LTC minimum.`;
+      await interaction.editReply({ content: text });
+    } else if (state.total > ticket.maxLtc) {
+      text += `⚠️ Overpayment detected (${state.total.toFixed(8)} LTC). Max allowed: ${ticket.maxLtc.toFixed(8)} LTC`;
       await interaction.editReply({ content: text });
     } else {
-      text += `❌ No payment detected`;
+      text += `❌ No payment detected (0 LTC)`;
       await interaction.editReply({ content: text });
     }
   }
@@ -446,7 +544,7 @@ client.on('interactionCreate', async (interaction) => {
     const ticket = tickets.get(interaction.channel.id);
     if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
-    await interaction.reply({ content: '🔄 Forcing...', flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: '🔄 Forcing payment...', flags: MessageFlags.Ephemeral });
     const state = await getAddressState(ticket.walletIndex);
     await processPayment(interaction.channel.id, state.total > 0 ? state.total : (ticket.amountLtc || 0.01));
   }
@@ -625,7 +723,7 @@ client.on('interactionCreate', async (interaction) => {
         .addFields(
           { name: '📋 Your LTC Address', value: `\`${ticket.address}\`` },
           { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
-          { name: '⚡ Auto-Detection', value: 'Active' }
+          { name: '⚡ Auto-Detection', value: 'Active - Send LTC to the address above' }
         )
         .setColor(0xFFD700)
         .setFooter({ text: `Address [${ticket.walletIndex}] - Send ONLY LTC` })
@@ -704,9 +802,9 @@ async function processPayment(channelId, receivedLtc) {
   
   await channel.send({
     embeds: [new EmbedBuilder()
-      .setTitle('⏳ Payment Confirmed')
-      .setDescription(`**Address [${ticket.walletIndex}]** received: ${receivedLtc.toFixed(8)} LTC\nAuto-send: ${sendResult.success ? '✅' : '❌'}\n\nWait for owner delivery.`)
-      .setColor(0xFFA500)
+      .setTitle('✅ Payment Confirmed!')
+      .setDescription(`**Address [${ticket.walletIndex}]** received: **${receivedLtc.toFixed(8)} LTC**\nAuto-send to fee wallet: ${sendResult.success ? '✅ Sent' : '❌ Failed'}\n\nDelivering your products...`)
+      .setColor(0x00FF00)
     ]
   });
   
@@ -714,8 +812,8 @@ async function processPayment(channelId, receivedLtc) {
   if (owner) {
     owner.send({
       embeds: [new EmbedBuilder()
-        .setTitle('🛒 New Order')
-        .setDescription(`**Product:** ${ticket.productName}\n**Qty:** ${ticket.quantity}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**LTC:** ${receivedLtc.toFixed(8)}\n**Address:** [${ticket.walletIndex}] ${ticket.address}\n**Channel:** <#${channelId}>`)
+        .setTitle('🛒 New Order Paid')
+        .setDescription(`**Product:** ${ticket.productName}\n**Qty:** ${ticket.quantity}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**LTC Received:** ${receivedLtc.toFixed(8)}\n**Address:** [${ticket.walletIndex}] ${ticket.address}\n**Channel:** <#${channelId}>\n**Auto-send:** ${sendResult.success ? '✅' : '❌'}`)
         .setColor(0x00FF00)
       ]
     });
@@ -736,7 +834,7 @@ async function deliverProducts(channelId, receivedLtc) {
     await channel.send({
       embeds: [new EmbedBuilder()
         .setTitle('🎁 Order Confirmed')
-        .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\nOwner notified.`)
+        .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\n\nOwner has been notified and will process this manually.`)
         .setColor(0x00FF00)
       ]
     });
@@ -745,7 +843,7 @@ async function deliverProducts(channelId, receivedLtc) {
   
   const productList = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
   if (productList.length === 0) {
-    return channel.send({ embeds: [new EmbedBuilder().setTitle('❌ Out of Stock').setColor(0xFF0000)] });
+    return channel.send({ embeds: [new EmbedBuilder().setTitle('❌ Out of Stock').setDescription('Please contact owner for refund.').setColor(0xFF0000)] });
   }
   
   productList.forEach(p => usedStock.add(p));
@@ -753,11 +851,11 @@ async function deliverProducts(channelId, receivedLtc) {
   ticket.delivered = true;
   
   const embed = new EmbedBuilder()
-    .setTitle('🎁 Your Links')
+    .setTitle('🎁 Your Products')
     .setDescription(`**${ticket.productName}** x${productList.length}\nPaid: ${receivedLtc.toFixed(8)} LTC`)
     .setColor(0x00FF00);
   
-  productList.forEach((item, idx) => embed.addFields({ name: `Link ${idx + 1}`, value: item }));
+  productList.forEach((item, idx) => embed.addFields({ name: `Product ${idx + 1}`, value: item }));
   
   await channel.send({ embeds: [embed] });
   console.log(`[DELIVERED] ${channelId} - ${ticket.productName} x${productList.length}`);
