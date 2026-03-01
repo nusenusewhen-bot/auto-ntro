@@ -16,7 +16,9 @@ const OWNER_ID = '1459833646130401429';
 const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 const BLOCKCHAIR_KEY = process.env.BLOCKCHAIR_KEY;
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
-const TOLERANCE_USD = 0.10;
+
+// 50% tolerance - accepts 50% under or over payment
+const TOLERANCE_PERCENT = 0.50; 
 
 const LITECOIN = { messagePrefix: '\x19Litecoin Signed Message:\n', bech32: 'ltc', bip32: { public: 0x019da462, private: 0x019d9cfe }, pubKeyHash: 0x30, scriptHash: 0x32, wif: 0xb0 };
 
@@ -45,13 +47,9 @@ function getLitecoinAddress(index) {
 async function getAddressState(address) {
   try {
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
-    console.log(`[API] Checking: ${address}`);
     const { data } = await axios.get(url, { timeout: 10000 });
     
-    if (!data?.data?.[address]) {
-      console.log(`[API] No data for ${address}`);
-      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
-    }
+    if (!data?.data?.[address]) return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
     
     const addr = data.data[address].address;
     const confirmed = addr.balance / 100000000;
@@ -65,8 +63,6 @@ async function getAddressState(address) {
       value: u.value,
       script: u.script_hex
     }));
-    
-    console.log(`[BALANCE] ${address}: confirmed=${confirmed.toFixed(8)}, unconfirmed=${unconfirmed.toFixed(8)}, total=${(confirmed + unconfirmed).toFixed(8)}`);
     
     return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos };
   } catch (error) {
@@ -152,7 +148,6 @@ client.once('ready', async () => {
   
   await client.application.commands.set(commands);
   
-  // FAST: Check every 3 seconds
   setInterval(monitorMempool, 3000);
   console.log('[SYSTEM] Payment monitoring started (3s intervals)');
 });
@@ -257,7 +252,8 @@ client.on('interactionCreate', async (interaction) => {
     
     let text = `**Payment Check**\n`;
     text += `Address: \`${ticket.address}\`\n`;
-    text += `Expected: ${ticket.minLtc?.toFixed(8)} - ${ticket.maxLtc?.toFixed(8)} LTC\n`;
+    text += `Expected: ${ticket.amountLtc} LTC (±${(TOLERANCE_PERCENT * 100).toFixed(0)}%)\n`;
+    text += `Range: ${ticket.minLtc?.toFixed(8)} - ${ticket.maxLtc?.toFixed(8)} LTC\n`;
     text += `Confirmed: ${state.confirmed.toFixed(8)} LTC\n`;
     text += `Unconfirmed: ${state.unconfirmed.toFixed(8)} LTC\n`;
     text += `**Total: ${state.total.toFixed(8)} LTC**\n\n`;
@@ -267,7 +263,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply({ content: text });
       await processPayment(interaction.channel.id, state.total);
     } else if (state.total > 0) {
-      text += `⚠️ Payment received but outside tolerance range`;
+      text += `⚠️ Payment received but outside tolerance range\nTry using /forcepay to deliver anyway`;
       await interaction.editReply({ content: text });
     } else {
       text += `❌ No payment detected yet`;
@@ -279,7 +275,8 @@ client.on('interactionCreate', async (interaction) => {
     if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
     await interaction.reply({ content: '🔄 Forcing payment processing...', flags: MessageFlags.Ephemeral });
-    await processPayment(interaction.channel.id, ticket.amountLtc || 0.01);
+    const state = await getAddressState(ticket.address);
+    await processPayment(interaction.channel.id, state.total > 0 ? state.total : (ticket.amountLtc || 0.01));
   }
   else if (interaction.commandName === 'close') {
     const ticket = tickets.get(interaction.channel.id);
@@ -405,18 +402,20 @@ client.on('interactionCreate', async (interaction) => {
     
     const totalUsd = ticket.price * qty;
     const totalLtc = (totalUsd / ltcPrice).toFixed(8);
-    const toleranceLtc = TOLERANCE_USD / ltcPrice;
+    
+    // 50% tolerance - accepts half or double the amount
+    const toleranceLtc = parseFloat(totalLtc) * TOLERANCE_PERCENT;
     
     ticket.quantity = qty;
     ticket.amountUsd = totalUsd;
     ticket.amountLtc = totalLtc;
     ticket.minLtc = parseFloat(totalLtc) - toleranceLtc;
-    ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc + 0.001;
+    ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc;
     ticket.status = 'awaiting_payment';
     ticket.paid = false;
     ticket.delivered = false;
     
-    console.log(`[AWAITING] ${ticket.address} | Need: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC (${totalLtc} ± ${toleranceLtc.toFixed(8)})`);
+    console.log(`[AWAITING] ${ticket.address} | Expected: ${totalLtc} LTC | Range: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC (±${(TOLERANCE_PERCENT * 100).toFixed(0)}%)`);
     
     await interaction.reply({ 
       embeds: [new EmbedBuilder()
@@ -424,7 +423,7 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(`**${ticket.productName}** x${qty}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
         .addFields(
           { name: '📋 LTC Address', value: `\`${ticket.address}\`` },
-          { name: '💰 Amount (±$0.10 OK)', value: `\`${totalLtc} LTC\`` },
+          { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
           { name: '⚡ Detection', value: 'INSTANT (0-confirmation)' }
         )
         .setColor(0xFFD700)
