@@ -36,35 +36,76 @@ const PRODUCTS = {
 };
 
 function getLitecoinAddress(index) {
-  // STRICT: Only allow 0-9
   const safeIndex = Math.max(0, Math.min(9, parseInt(index) || 0));
   
   const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
   const root = bip32.fromSeed(seed, LITECOIN);
   const child = root.derivePath(`m/44'/2'/0'/0/${safeIndex}`);
-  const { address } = bitcoin.payments.p2pkh({ pubkey: Buffer.from(child.publicKey), network: LITECOIN });
+  const pubkey = Buffer.from(child.publicKey);
+  
+  // Generate ALL address types to check which one has balance
+  const legacy = bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
+  const segwit = bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN }), network: LITECOIN });
+  const nativeSegwit = bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN });
+  
   const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
-  return { address, privateKey: keyPair.toWIF(), index: safeIndex };
+  
+  return { 
+    address: legacy.address, // Default to legacy for compatibility
+    segwitAddress: segwit.address, // M... address
+    nativeSegwitAddress: nativeSegwit.address, // ltc1... address
+    privateKey: keyPair.toWIF(), 
+    index: safeIndex,
+    publicKey: pubkey.toString('hex')
+  };
 }
 
 async function getAddressState(address) {
   try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
-    const { data } = await axios.get(url, { timeout: 10000 });
+    // Try the address as-is first
+    let url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
+    let { data } = await axios.get(url, { timeout: 10000 });
+    
+    // If no data, try alternative address formats
+    if (!data?.data?.[address]) {
+      console.log(`[API] No data for ${address}, trying to find correct format...`);
+      
+      // Check if it's a known address we can map
+      for (let i = 0; i <= 9; i++) {
+        const wallet = getLitecoinAddress(i);
+        if (wallet.address === address || wallet.segwitAddress === address || wallet.nativeSegwitAddress === address) {
+          // Try all formats for this index
+          const formats = [wallet.address, wallet.segwitAddress, wallet.nativeSegwitAddress];
+          for (const fmt of formats) {
+            if (!fmt) continue;
+            try {
+              url = `https://api.blockchair.com/litecoin/dashboards/address/${fmt}?transaction_details=true&key=${BLOCKCHAIR_KEY}`;
+              const test = await axios.get(url, { timeout: 10000 });
+              if (test?.data?.data?.[fmt]) {
+                console.log(`[API] Found balance on format: ${fmt}`);
+                data = test.data;
+                address = fmt;
+                break;
+              }
+            } catch (e) {}
+          }
+          break;
+        }
+      }
+    }
     
     if (!data?.data?.[address]) {
-      console.log(`[API] No data for ${address}`);
-      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+      console.log(`[API] No data found for any format of ${address}`);
+      return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [], address: address };
     }
     
     const addr = data.data[address].address;
-    // Blockchair returns values in satoshis, convert to LTC (1 LTC = 100,000,000 satoshis)
+    // Blockchair returns values in satoshis
     const confirmed = (addr.balance || 0) / 100000000;
     const received = (addr.received || 0) / 100000000;
     const spent = (addr.spent || 0) / 100000000;
     const unconfirmed = Math.max(0, received - spent - confirmed);
     
-    // FIX: Properly extract UTXOs with correct value conversion
     const utxos = [];
     if (data.data[address].utxo && Array.isArray(data.data[address].utxo)) {
       for (const u of data.data[address].utxo) {
@@ -72,8 +113,9 @@ async function getAddressState(address) {
           utxos.push({
             txid: u.transaction_hash,
             vout: u.index,
-            value: parseInt(u.value), // Keep in satoshis for transaction building
-            script: u.script_hex
+            value: parseInt(u.value),
+            script: u.script_hex,
+            address: address // Keep track of which address format this UTXO belongs to
           });
         }
       }
@@ -81,31 +123,47 @@ async function getAddressState(address) {
     
     console.log(`[BALANCE] ${address}: ${confirmed.toFixed(8)} LTC confirmed, ${utxos.length} UTXOs`);
     
-    return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos };
+    return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos, address };
   } catch (error) {
     console.error(`[API ERROR] ${address}: ${error.message}`);
-    return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [] };
+    return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [], address };
   }
 }
 
 async function sendAllLTC(fromIndex, toAddress) {
   try {
-    // STRICT: Only allow 0-9
     const safeIndex = Math.max(0, Math.min(9, parseInt(fromIndex) || 0));
     const wallet = getLitecoinAddress(safeIndex);
-    const state = await getAddressState(wallet.address);
     
-    console.log(`[SEND] Index ${safeIndex}: ${state.confirmed.toFixed(8)} LTC, ${state.utxos.length} UTXOs`);
+    // Check ALL address formats for this index
+    const formats = [
+      { address: wallet.address, type: 'legacy' },
+      { address: wallet.segwitAddress, type: 'segwit' },
+      { address: wallet.nativeSegwitAddress, type: 'native' }
+    ];
     
-    if (state.confirmed <= 0.0001) return { success: false, error: 'No confirmed balance' };
-    if (state.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
+    let totalState = { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
+    let usedFormat = null;
+    
+    for (const fmt of formats) {
+      if (!fmt.address) continue;
+      const state = await getAddressState(fmt.address);
+      if (state.total > totalState.total) {
+        totalState = state;
+        usedFormat = fmt;
+      }
+    }
+    
+    console.log(`[SEND] Index ${safeIndex}: Best format ${usedFormat?.type} (${usedFormat?.address}) with ${totalState.total.toFixed(8)} LTC`);
+    
+    if (totalState.total <= 0.0001) return { success: false, error: 'No balance on any address format' };
+    if (totalState.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
     
     const psbt = new bitcoin.Psbt({ network: LITECOIN });
     let totalInput = 0;
     let addedInputs = 0;
     
-    // FIX: Add all UTXOs with proper raw transaction fetching
-    for (const utxo of state.utxos) {
+    for (const utxo of totalState.utxos) {
       try {
         const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}?key=${BLOCKCHAIR_KEY}`;
         const { data } = await axios.get(txUrl, { timeout: 10000 });
@@ -113,15 +171,24 @@ async function sendAllLTC(fromIndex, toAddress) {
         if (data?.data?.[utxo.txid]?.raw_transaction) {
           const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
           
-          psbt.addInput({
+          // Determine input type based on address format
+          const inputData = {
             hash: utxo.txid,
             index: utxo.vout,
             nonWitnessUtxo: rawTx
-          });
+          };
           
+          // If SegWit, add witnessUtxo
+          if (usedFormat.type !== 'legacy') {
+            inputData.witnessUtxo = {
+              script: Buffer.from(utxo.script, 'hex'),
+              value: utxo.value
+            };
+          }
+          
+          psbt.addInput(inputData);
           totalInput += utxo.value;
           addedInputs++;
-          console.log(`[SEND] Added input: ${utxo.txid.slice(0,16)}... vout=${utxo.vout} value=${utxo.value}`);
         }
       } catch (e) {
         console.log(`[SEND] Failed to add input ${utxo.txid}: ${e.message}`);
@@ -131,39 +198,26 @@ async function sendAllLTC(fromIndex, toAddress) {
     
     if (addedInputs === 0) return { success: false, error: 'No spendable inputs found' };
     
-    // FIX: Proper fee calculation (0.001 LTC = 100,000 satoshis)
-    const fee = 100000; // 0.001 LTC fee
+    const fee = 100000; // 0.001 LTC
     const amount = totalInput - fee;
     
-    if (amount <= 0) return { success: false, error: `Amount too small for fee. Input: ${totalInput}, Fee: ${fee}` };
-    
-    console.log(`[SEND] Total input: ${totalInput} satoshi, Fee: ${fee}, Sending: ${amount}`);
+    if (amount <= 0) return { success: false, error: `Amount too small for fee` };
     
     psbt.addOutput({ address: toAddress, value: amount });
     
-    // FIX: Proper signing with ECPair
     const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
     
     for (let i = 0; i < psbt.inputCount; i++) {
       try {
         psbt.signInput(i, keyPair);
-        console.log(`[SEND] Signed input ${i}`);
       } catch (e) {
         console.log(`[SEND] Failed to sign input ${i}: ${e.message}`);
       }
     }
     
-    // FIX: Only finalize if all inputs signed
-    try {
-      psbt.finalizeAllInputs();
-    } catch (e) {
-      return { success: false, error: `Failed to finalize: ${e.message}` };
-    }
-    
+    psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
-    console.log(`[SEND] Transaction hex length: ${txHex.length}`);
     
-    // FIX: Proper broadcast with correct params
     const broadcast = await axios.post(
       `https://api.blockchair.com/litecoin/push/transaction?key=${BLOCKCHAIR_KEY}`,
       { data: txHex },
@@ -171,15 +225,14 @@ async function sendAllLTC(fromIndex, toAddress) {
     );
     
     if (broadcast.data?.data?.transaction_hash) {
-      console.log(`[SEND] Success! TXID: ${broadcast.data.data.transaction_hash}`);
       return { 
         success: true, 
         txid: broadcast.data.data.transaction_hash, 
         amount: amount / 100000000, 
-        fee: fee / 100000000 
+        fee: fee / 100000000,
+        fromAddress: usedFormat.address
       };
     } else {
-      console.log(`[SEND] Broadcast failed:`, broadcast.data);
       return { success: false, error: 'Broadcast failed', details: broadcast.data };
     }
   } catch (error) {
@@ -190,7 +243,6 @@ async function sendAllLTC(fromIndex, toAddress) {
 
 client.once('ready', async () => {
   console.log(`[READY] Bot logged in as ${client.user.tag}`);
-  console.log('[SETTINGS] Current:', JSON.stringify(settings));
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
@@ -204,14 +256,192 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('balance').setDescription('Check wallet balance (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true)),
     new SlashCommandBuilder().setName('check').setDescription('Manually check payment status (Owner)'),
     new SlashCommandBuilder().setName('forcepay').setDescription('Force mark as paid and deliver (Owner)'),
-    new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)')
+    new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)'),
+    new SlashCommandBuilder().setName('debug').setDescription('Debug wallet addresses (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true))
   ];
   
   await client.application.commands.set(commands);
-  
-  // FIX: Slower interval to avoid rate limits
   setInterval(monitorMempool, 5000);
-  console.log('[SYSTEM] Payment monitoring started (5s intervals)');
+  console.log('[SYSTEM] Payment monitoring started');
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  
+  const isOwner = interaction.user.id === OWNER_ID;
+  const isStaff = settings.staffRole && interaction.member?.roles?.cache?.has(settings.staffRole);
+  
+  if (!isOwner && !['close'].includes(interaction.commandName)) {
+    return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
+  }
+  
+  if (interaction.commandName === 'close' && !is [], address: address };
+    }
+    
+    const addr = data.data[address].address;
+    // Blockchair returns values in satoshis
+    const confirmed = (addr.balance || 0) / 100000000;
+    const received = (addr.received || 0) / 100000000;
+    const spent = (addr.spent || 0) / 100000000;
+    const unconfirmed = Math.max(0, received - spent - confirmed);
+    
+    const utxos = [];
+    if (data.data[address].utxo && Array.isArray(data.data[address].utxo)) {
+      for (const u of data.data[address].utxo) {
+        if (u.value > 0) {
+          utxos.push({
+            txid: u.transaction_hash,
+            vout: u.index,
+            value: parseInt(u.value),
+            script: u.script_hex,
+            address: address // Keep track of which address format this UTXO belongs to
+          });
+        }
+      }
+    }
+    
+    console.log(`[BALANCE] ${address}: ${confirmed.toFixed(8)} LTC confirmed, ${utxos.length} UTXOs`);
+    
+    return { confirmed, unconfirmed, total: confirmed + unconfirmed, txs: data.data[address].transactions || [], utxos, address };
+  } catch (error) {
+    console.error(`[API ERROR] ${address}: ${error.message}`);
+    return { confirmed: 0, unconfirmed: 0, total: 0, txs: [], utxos: [], address };
+  }
+}
+
+async function sendAllLTC(fromIndex, toAddress) {
+  try {
+    const safeIndex = Math.max(0, Math.min(9, parseInt(fromIndex) || 0));
+    const wallet = getLitecoinAddress(safeIndex);
+    
+    // Check ALL address formats for this index
+    const formats = [
+      { address: wallet.address, type: 'legacy' },
+      { address: wallet.segwitAddress, type: 'segwit' },
+      { address: wallet.nativeSegwitAddress, type: 'native' }
+    ];
+    
+    let totalState = { confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
+    let usedFormat = null;
+    
+    for (const fmt of formats) {
+      if (!fmt.address) continue;
+      const state = await getAddressState(fmt.address);
+      if (state.total > totalState.total) {
+        totalState = state;
+        usedFormat = fmt;
+      }
+    }
+    
+    console.log(`[SEND] Index ${safeIndex}: Best format ${usedFormat?.type} (${usedFormat?.address}) with ${totalState.total.toFixed(8)} LTC`);
+    
+    if (totalState.total <= 0.0001) return { success: false, error: 'No balance on any address format' };
+    if (totalState.utxos.length === 0) return { success: false, error: 'No UTXOs found' };
+    
+    const psbt = new bitcoin.Psbt({ network: LITECOIN });
+    let totalInput = 0;
+    let addedInputs = 0;
+    
+    for (const utxo of totalState.utxos) {
+      try {
+        const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.txid}?key=${BLOCKCHAIR_KEY}`;
+        const { data } = await axios.get(txUrl, { timeout: 10000 });
+        
+        if (data?.data?.[utxo.txid]?.raw_transaction) {
+          const rawTx = Buffer.from(data.data[utxo.txid].raw_transaction, 'hex');
+          
+          // Determine input type based on address format
+          const inputData = {
+            hash: utxo.txid,
+            index: utxo.vout,
+            nonWitnessUtxo: rawTx
+          };
+          
+          // If SegWit, add witnessUtxo
+          if (usedFormat.type !== 'legacy') {
+            inputData.witnessUtxo = {
+              script: Buffer.from(utxo.script, 'hex'),
+              value: utxo.value
+            };
+          }
+          
+          psbt.addInput(inputData);
+          totalInput += utxo.value;
+          addedInputs++;
+        }
+      } catch (e) {
+        console.log(`[SEND] Failed to add input ${utxo.txid}: ${e.message}`);
+        continue;
+      }
+    }
+    
+    if (addedInputs === 0) return { success: false, error: 'No spendable inputs found' };
+    
+    const fee = 100000; // 0.001 LTC
+    const amount = totalInput - fee;
+    
+    if (amount <= 0) return { success: false, error: `Amount too small for fee` };
+    
+    psbt.addOutput({ address: toAddress, value: amount });
+    
+    const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
+    
+    for (let i = 0; i < psbt.inputCount; i++) {
+      try {
+        psbt.signInput(i, keyPair);
+      } catch (e) {
+        console.log(`[SEND] Failed to sign input ${i}: ${e.message}`);
+      }
+    }
+    
+    psbt.finalizeAllInputs();
+    const txHex = psbt.extractTransaction().toHex();
+    
+    const broadcast = await axios.post(
+      `https://api.blockchair.com/litecoin/push/transaction?key=${BLOCKCHAIR_KEY}`,
+      { data: txHex },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    
+    if (broadcast.data?.data?.transaction_hash) {
+      return { 
+        success: true, 
+        txid: broadcast.data.data.transaction_hash, 
+        amount: amount / 100000000, 
+        fee: fee / 100000000,
+        fromAddress: usedFormat.address
+      };
+    } else {
+      return { success: false, error: 'Broadcast failed', details: broadcast.data };
+    }
+  } catch (error) {
+    console.error(`[SEND ERROR]`, error);
+    return { success: false, error: error.message };
+  }
+}
+
+client.once('ready', async () => {
+  console.log(`[READY] Bot logged in as ${client.user.tag}`);
+  
+  const commands = [
+    new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
+    new SlashCommandBuilder().setName('ticketcategory').setDescription('Set ticket category (Owner)').addStringOption(o => o.setName('id').setDescription('Category ID').setRequired(true)),
+    new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role (Owner)').addStringOption(o => o.setName('id').setDescription('Role ID').setRequired(true)),
+    new SlashCommandBuilder().setName('transcriptchannel').setDescription('Set transcript channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
+    new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
+    new SlashCommandBuilder().setName('settings').setDescription('View current settings (Owner)'),
+    new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
+    new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
+    new SlashCommandBuilder().setName('balance').setDescription('Check wallet balance (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true)),
+    new SlashCommandBuilder().setName('check').setDescription('Manually check payment status (Owner)'),
+    new SlashCommandBuilder().setName('forcepay').setDescription('Force mark as paid and deliver (Owner)'),
+    new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)'),
+    new SlashCommandBuilder().setName('debug').setDescription('Debug wallet addresses (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true))
+  ];
+  
+  await client.application.commands.set(commands);
+  setInterval(monitorMempool, 5000);
+  console.log('[SYSTEM] Payment monitoring started');
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -229,16 +459,9 @@ client.on('interactionCreate', async (interaction) => {
   }
   
   if (interaction.commandName === 'panel') {
-    console.log(`[DEBUG] /panel used. Category: ${settings.ticketCategory}`);
-    
     if (!settings.ticketCategory) {
       return interaction.reply({ 
-        content: `❌ **Not setup!** Use these commands first:\n\n` +
-                `1. \`/ticketcategory\` (ID: ${settings.ticketCategory || 'NOT SET'})\n` +
-                `2. \`/staffroleid\` (ID: ${settings.staffRole || 'NOT SET'})\n` +
-                `3. \`/transcriptchannel\` (ID: ${settings.transcriptChannel || 'NOT SET'})\n` +
-                `4. \`/salechannel\` (ID: ${settings.saleChannel || 'NOT SET'})\n\n` +
-                `Use \`/settings\` to check current values.`, 
+        content: `❌ **Not setup!** Use:\n1. \`/ticketcategory\`\n2. \`/staffroleid\`\n3. \`/transcriptchannel\`\n4. \`/salechannel\``, 
         flags: MessageFlags.Ephemeral 
       });
     }
@@ -252,117 +475,123 @@ client.on('interactionCreate', async (interaction) => {
     );
     await interaction.reply({ embeds: [embed], components: [row] });
   }
+  else if (interaction.commandName === 'debug') {
+    const idx = interaction.options.getInteger('index');
+    if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index 0-9 only', flags: MessageFlags.Ephemeral });
+    
+    const wallet = getLitecoinAddress(idx);
+    
+    // Check all formats
+    const legacyState = await getAddressState(wallet.address);
+    const segwitState = await getAddressState(wallet.segwitAddress);
+    const nativeState = await getAddressState(wallet.nativeSegwitAddress);
+    
+    const embed = new EmbedBuilder()
+      .setTitle(`🔍 Debug Wallet ${idx}`)
+      .addFields(
+        { name: 'Legacy (L...)', value: `\`${wallet.address}\`\nBalance: ${legacyState.total.toFixed(8)} LTC`, inline: false },
+        { name: 'SegWit (M...)', value: `\`${wallet.segwitAddress}\`\nBalance: ${segwitState.total.toFixed(8)} LTC`, inline: false },
+        { name: 'Native SegWit (ltc1...)', value: `\`${wallet.nativeSegwitAddress}\`\nBalance: ${nativeState.total.toFixed(8)} LTC`, inline: false }
+      )
+      .setColor(0x00FF00);
+    
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  }
   else if (interaction.commandName === 'settings') {
     await interaction.reply({
-      content: `**Current Settings:**\n` +
-               `Ticket Category: ${settings.ticketCategory || '❌ Not set'}\n` +
-               `Staff Role: ${settings.staffRole || '❌ Not set'}\n` +
-               `Transcript Channel: ${settings.transcriptChannel || '❌ Not set'}\n` +
-               `Sale Channel: ${settings.saleChannel || '❌ Not set'}`,
+      content: `**Settings:**\nCategory: ${settings.ticketCategory || '❌'}\nStaff: ${settings.staffRole || '❌'}\nTranscript: ${settings.transcriptChannel || '❌'}\nSale: ${settings.saleChannel || '❌'}`,
       flags: MessageFlags.Ephemeral
     });
   }
   else if (interaction.commandName === 'ticketcategory') { 
-    const id = interaction.options.getString('id');
-    settings.ticketCategory = id;
-    console.log(`[SETTINGS] Category set to: ${id}`);
-    await interaction.reply({ content: `✅ Category set to: ${id}\n\nNow use \`/panel\` to spawn the shop.`, flags: MessageFlags.Ephemeral }); 
+    settings.ticketCategory = interaction.options.getString('id');
+    await interaction.reply({ content: `✅ Category set`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'staffroleid') { 
-    const id = interaction.options.getString('id');
-    settings.staffRole = id;
-    console.log(`[SETTINGS] Staff role set to: ${id}`);
-    await interaction.reply({ content: `✅ Staff role set to: ${id}`, flags: MessageFlags.Ephemeral }); 
+    settings.staffRole = interaction.options.getString('id');
+    await interaction.reply({ content: `✅ Staff role set`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'transcriptchannel') { 
-    const id = interaction.options.getString('id');
-    settings.transcriptChannel = id;
-    console.log(`[SETTINGS] Transcript set to: ${id}`);
-    await interaction.reply({ content: `✅ Transcript channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
+    settings.transcriptChannel = interaction.options.getString('id');
+    await interaction.reply({ content: `✅ Transcript set`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'salechannel') { 
-    const id = interaction.options.getString('id');
-    settings.saleChannel = id;
-    console.log(`[SETTINGS] Sale channel set to: ${id}`);
-    await interaction.reply({ content: `✅ Sales channel set to: ${id}`, flags: MessageFlags.Ephemeral }); 
+    settings.saleChannel = interaction.options.getString('id');
+    await interaction.reply({ content: `✅ Sale channel set`, flags: MessageFlags.Ephemeral }); 
   }
   else if (interaction.commandName === 'send') {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const address = interaction.options.getString('address');
     
-    try { 
-      bitcoin.address.toOutputScript(address, LITECOIN); 
-    } catch (e) { 
-      return interaction.editReply({ content: '❌ Invalid LTC address!' }); 
-    }
-    
-    await interaction.editReply({ content: '🔄 Scanning wallets 0-9...' });
-    
     const results = [];
-    // STRICT: Only scan 0-9
     for (let i = 0; i <= 9; i++) {
-      const wallet = getLitecoinAddress(i);
-      const state = await getAddressState(wallet.address);
-      if (state.total > 0.001) {
-        const result = await sendAllLTC(i, address);
-        results.push({ index: i, ...result, balance: state.total });
+      const result = await sendAllLTC(i, address);
+      if (result.success || result.balance > 0) {
+        results.push({ index: i, ...result });
       }
     }
     
-    let text = `**Sweep Complete!**\nFound ${results.length} wallets with balance\n\n`;
+    let text = `**Sweep Results:**\n`;
     for (const r of results) {
       if (r.success) {
-        text += `✅ Index ${r.index}: ${r.balance?.toFixed(8)} LTC sent\nTx: ${r.txid?.slice(0,20)}...\n`;
-      } else {
-        text += `❌ Index ${r.index}: ${r.error}\n`;
+        text += `✅ Index ${r.index} (${r.fromAddress?.slice(0,10)}...): Sent ${r.amount?.toFixed(8)} LTC\n`;
+      } else if (r.balance > 0) {
+        text += `⚠️ Index ${r.index}: ${r.balance.toFixed(8)} LTC but failed to send (${r.error})\n`;
       }
     }
-    
-    if (results.length === 0) text += 'No wallets with balance found.';
+    if (results.length === 0) text += 'No balances found on indices 0-9';
     await interaction.editReply({ content: text });
   }
   else if (interaction.commandName === 'balance') {
     const idx = interaction.options.getInteger('index');
-    // STRICT: Enforce 0-9
     if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index 0-9 only', flags: MessageFlags.Ephemeral });
     
     const wallet = getLitecoinAddress(idx);
-    const state = await getAddressState(wallet.address);
+    
+    // Check all formats and pick the one with balance
+    const formats = [
+      { name: 'Legacy', addr: wallet.address },
+      { name: 'SegWit', addr: wallet.segwitAddress },
+      { name: 'Native', addr: wallet.nativeSegwitAddress }
+    ];
+    
+    let bestState = null;
+    let bestFormat = null;
+    
+    for (const fmt of formats) {
+      const state = await getAddressState(fmt.addr);
+      if (!bestState || state.total > bestState.total) {
+        bestState = state;
+        bestFormat = fmt;
+      }
+    }
     
     await interaction.reply({
       embeds: [new EmbedBuilder()
-        .setTitle(`💰 Wallet ${idx}`)
-        .setDescription(`Address: \`${wallet.address}\`\nConfirmed: ${state.confirmed.toFixed(8)} LTC\nUnconfirmed: ${state.unconfirmed.toFixed(8)} LTC\n**Total: ${state.total.toFixed(8)} LTC**`)
-        .setColor(state.total > 0 ? 0x00FF00 : 0xFF0000)
+        .setTitle(`💰 Wallet ${idx} (${bestFormat.name})`)
+        .setDescription(`Address: \`${bestFormat.addr}\`\nConfirmed: ${bestState.confirmed.toFixed(8)} LTC\nUnconfirmed: ${bestState.unconfirmed.toFixed(8)} LTC\n**Total: ${bestState.total.toFixed(8)} LTC**`)
+        .setColor(bestState.total > 0 ? 0x00FF00 : 0xFF0000)
       ],
       flags: MessageFlags.Ephemeral
     });
   }
   else if (interaction.commandName === 'check') {
     const ticket = tickets.get(interaction.channel.id);
-    if (!ticket) return interaction.reply({ content: '❌ No active ticket in this channel', flags: MessageFlags.Ephemeral });
-    if (!ticket.address) return interaction.reply({ content: '❌ No payment address set', flags: MessageFlags.Ephemeral });
+    if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
     await interaction.deferReply();
+    
+    // Check the specific address stored in ticket
     const state = await getAddressState(ticket.address);
     
-    let text = `**Payment Check**\n`;
-    text += `Address: \`${ticket.address}\`\n`;
-    text += `Expected: ${ticket.amountLtc} LTC (±${(TOLERANCE_PERCENT * 100).toFixed(0)}%)\n`;
-    text += `Range: ${ticket.minLtc?.toFixed(8)} - ${ticket.maxLtc?.toFixed(8)} LTC\n`;
-    text += `Confirmed: ${state.confirmed.toFixed(8)} LTC\n`;
-    text += `Unconfirmed: ${state.unconfirmed.toFixed(8)} LTC\n`;
-    text += `**Total: ${state.total.toFixed(8)} LTC**\n\n`;
+    let text = `**Payment Check**\nAddress: \`${ticket.address}\`\nExpected: ${ticket.amountLtc} LTC\nDetected: ${state.total.toFixed(8)} LTC\n\n`;
     
     if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
-      text += `✅ **PAYMENT DETECTED!** Triggering delivery...`;
+      text += `✅ **PAYMENT DETECTED!**`;
       await interaction.editReply({ content: text });
       await processPayment(interaction.channel.id, state.total);
-    } else if (state.total > 0) {
-      text += `⚠️ Payment received but outside tolerance range\nTry using /forcepay to deliver anyway`;
-      await interaction.editReply({ content: text });
     } else {
-      text += `❌ No payment detected yet`;
+      text += `❌ Waiting for payment...`;
       await interaction.editReply({ content: text });
     }
   }
@@ -370,26 +599,11 @@ client.on('interactionCreate', async (interaction) => {
     const ticket = tickets.get(interaction.channel.id);
     if (!ticket) return interaction.reply({ content: '❌ No active ticket', flags: MessageFlags.Ephemeral });
     
-    await interaction.reply({ content: '🔄 Forcing payment processing...', flags: MessageFlags.Ephemeral });
-    const state = await getAddressState(ticket.address);
-    await processPayment(interaction.channel.id, state.total > 0 ? state.total : (ticket.amountLtc || 0.01));
+    await interaction.reply({ content: '🔄 Forcing...', flags: MessageFlags.Ephemeral });
+    await processPayment(interaction.channel.id, ticket.amountLtc || 0.01);
   }
   else if (interaction.commandName === 'close') {
     const ticket = tickets.get(interaction.channel.id);
-    if (ticket && settings.transcriptChannel) {
-      const ch = await interaction.guild.channels.fetch(settings.transcriptChannel).catch(() => null);
-      if (ch) ch.send({ 
-        embeds: [new EmbedBuilder()
-          .setTitle('Ticket Closed')
-          .addFields(
-            { name: 'User', value: `<@${ticket.userId}>`, inline: true },
-            { name: 'Product', value: ticket.productName || 'N/A', inline: true }
-          )
-          .setTimestamp()
-        ] 
-      });
-    }
-    
     tickets.delete(interaction.channel.id);
     await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
@@ -406,27 +620,28 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
   
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
-    console.log(`[DEBUG] open_ticket clicked. Category: ${settings.ticketCategory}`);
-    
     if (!settings.ticketCategory) {
-      return interaction.reply({ 
-        content: `❌ **Not setup!** Category not set.\n\nUse \`/ticketcategory\` with a category ID first.\nCurrent value: ${settings.ticketCategory || 'NULL'}\n\nUse \`/settings\` to see all settings.`, 
-        flags: MessageFlags.Ephemeral 
-      });
+      return interaction.reply({ content: `❌ Not setup! Use /ticketcategory first.`, flags: MessageFlags.Ephemeral });
     }
     
     for (const [chId, t] of tickets) {
-      if (t.userId === interaction.user.id && t.status !== 'delivered' && t.status !== 'closed') {
+      if (t.userId === interaction.user.id && t.status !== 'delivered') {
         const ch = interaction.guild.channels.cache.get(chId);
         if (ch) return interaction.reply({ content: `❌ You have a ticket: ${ch}`, flags: MessageFlags.Ephemeral });
-        else tickets.delete(chId);
       }
     }
     
-    // STRICT: Only use 0-9, reset to 0 if at 10
     if (addressIndex > 9) addressIndex = 0;
     
     const wallet = getLitecoinAddress(addressIndex);
+    
+    // Use the address format that has balance, default to legacy
+    const legacyState = await getAddressState(wallet.address);
+    const segwitState = await getAddressState(wallet.segwitAddress);
+    
+    let useAddress = wallet.address;
+    if (segwitState.total > legacyState.total) useAddress = wallet.segwitAddress;
+    
     const channel = await interaction.guild.channels.create({
       name: `nitro-${interaction.user.username}`,
       type: ChannelType.GuildText,
@@ -462,13 +677,12 @@ client.on('interactionCreate', async (interaction) => {
       status: 'selecting', 
       channelId: channel.id,
       walletIndex: addressIndex,
-      address: wallet.address,
+      address: useAddress,
       privateKey: wallet.privateKey
     });
     
-    console.log(`[TICKET] ${channel.id} using index ${addressIndex}, address: ${wallet.address}`);
+    console.log(`[TICKET] ${channel.id} index ${addressIndex}, address: ${useAddress}`);
     addressIndex++;
-    // STRICT: Keep index within 0-9
     if (addressIndex > 9) addressIndex = 0;
     
     await interaction.reply({ content: `✅ ${channel}`, flags: MessageFlags.Ephemeral });
@@ -485,16 +699,11 @@ client.on('interactionCreate', async (interaction) => {
           .setCustomId('members_type_select')
           .setPlaceholder('Choose Members Type')
           .addOptions(
-            { label: 'Offline Members - $0.70 per 1000', value: 'members_offline', emoji: '⚫', description: 'Offline server members' },
-            { label: 'Online Members - $1.50 per 1000', value: 'members_online', emoji: '🟢', description: 'Online server members' }
+            { label: 'Offline Members - $0.70 per 1000', value: 'members_offline', emoji: '⚫' },
+            { label: 'Online Members - $1.50 per 1000', value: 'members_online', emoji: '🟢' }
           )
       );
-      
-      await interaction.update({ 
-        embeds: [new EmbedBuilder().setTitle('👥 Choose Members Type').setDescription('Select the type of members you want:').setColor(0x00FF00)], 
-        components: [row] 
-      });
-      return;
+      return interaction.update({ embeds: [new EmbedBuilder().setTitle('👥 Choose Type').setColor(0x00FF00)], components: [row] });
     }
     
     const product = PRODUCTS[productKey];
@@ -506,16 +715,7 @@ client.on('interactionCreate', async (interaction) => {
     const modal = new ModalBuilder()
       .setCustomId('qty')
       .setTitle('Quantity')
-      .addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('quantity')
-            .setLabel('How many?')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('1')
-            .setRequired(true)
-        )
-      );
+      .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('quantity').setLabel('How many?').setStyle(TextInputStyle.Short).setPlaceholder('1').setRequired(true)));
     
     await interaction.showModal(modal);
   }
@@ -534,17 +734,8 @@ client.on('interactionCreate', async (interaction) => {
     
     const modal = new ModalBuilder()
       .setCustomId('members_qty')
-      .setTitle('Enter Amount of Members')
-      .addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('member_amount')
-            .setLabel(`How many members? (in multiples of ${product.unit})`)
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('1000')
-            .setRequired(true)
-        )
-      );
+      .setTitle('Enter Amount')
+      .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('member_amount').setLabel('How many members?').setStyle(TextInputStyle.Short).setPlaceholder('1000').setRequired(true)));
     
     await interaction.showModal(modal);
   }
@@ -555,13 +746,10 @@ client.on('interactionCreate', async (interaction) => {
     if (!ticket) return;
     
     const available = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s));
-    if (available.length < qty) {
-      return interaction.reply({ content: `❌ Only ${available.length} left`, flags: MessageFlags.Ephemeral });
-    }
+    if (available.length < qty) return interaction.reply({ content: `❌ Only ${available.length} left`, flags: MessageFlags.Ephemeral });
     
     const totalUsd = ticket.price * qty;
     const totalLtc = (totalUsd / ltcPrice).toFixed(8);
-    
     const toleranceLtc = parseFloat(totalLtc) * TOLERANCE_PERCENT;
     
     ticket.quantity = qty;
@@ -570,10 +758,6 @@ client.on('interactionCreate', async (interaction) => {
     ticket.minLtc = parseFloat(totalLtc) - toleranceLtc;
     ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc;
     ticket.status = 'awaiting_payment';
-    ticket.paid = false;
-    ticket.delivered = false;
-    
-    console.log(`[AWAITING] ${ticket.address} | Expected: ${totalLtc} LTC | Range: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC (±${(TOLERANCE_PERCENT * 100).toFixed(0)}%)`);
     
     await interaction.reply({ 
       embeds: [new EmbedBuilder()
@@ -581,11 +765,9 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(`**${ticket.productName}** x${qty}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
         .addFields(
           { name: '📋 LTC Address', value: `\`${ticket.address}\`` },
-          { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
-          { name: '⚡ Detection', value: 'INSTANT (0-confirmation)' }
+          { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` }
         )
         .setColor(0xFFD700)
-        .setFooter({ text: 'Send LTC now. Bot detects instantly and auto-sends!' })
       ] 
     });
   }
@@ -595,14 +777,11 @@ client.on('interactionCreate', async (interaction) => {
     const ticket = tickets.get(interaction.channel.id);
     if (!ticket) return;
     
-    if (isNaN(memberAmount) || memberAmount < 1000) {
-      return interaction.reply({ content: '❌ Minimum order is 1000 members', flags: MessageFlags.Ephemeral });
-    }
+    if (isNaN(memberAmount) || memberAmount < 1000) return interaction.reply({ content: '❌ Minimum 1000', flags: MessageFlags.Ephemeral });
     
     const units = memberAmount / ticket.unit;
     const totalUsd = units * ticket.price;
     const totalLtc = (totalUsd / ltcPrice).toFixed(8);
-    
     const toleranceLtc = parseFloat(totalLtc) * TOLERANCE_PERCENT;
     
     ticket.quantity = memberAmount;
@@ -611,204 +790,29 @@ client.on('interactionCreate', async (interaction) => {
     ticket.minLtc = parseFloat(totalLtc) - toleranceLtc;
     ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc;
     ticket.status = 'awaiting_payment';
-    ticket.paid = false;
-    ticket.delivered = false;
-    
-    console.log(`[AWAITING-MEMBERS] ${ticket.address} | ${memberAmount} members | $${totalUsd.toFixed(2)} | ${totalLtc} LTC`);
     
     await interaction.reply({ 
       embeds: [new EmbedBuilder()
-        .setTitle('💳 Payment - Members Order')
-        .setDescription(`**${ticket.productName}**\n**Amount:** ${memberAmount.toLocaleString()} members\n**Rate:** $${ticket.price} per ${ticket.unit}\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
-        .addFields(
-          { name: '📋 LTC Address', value: `\`${ticket.address}\`` },
-          { name: '💰 Amount (±50% OK)', value: `\`${totalLtc} LTC\`` },
-          { name: '⚡ Detection', value: 'INSTANT (0-confirmation)' }
-        )
+        .setTitle('💳 Payment - Members')
+        .setDescription(`**${ticket.productName}**\n**Amount:** ${memberAmount.toLocaleString()} members\n**Total:** $${totalUsd.toFixed(2)} (~${totalLtc} LTC)`)
+        .addFields({ name: '📋 LTC Address', value: `\`${ticket.address}\`` })
         .setColor(0xFFD700)
-        .setFooter({ text: 'Send LTC now. Bot detects instantly and auto-sends!' })
       ] 
     });
   }
 });
 
 async function monitorMempool() {
-  const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment' && t.address);
-  
-  if (awaiting.length > 0) {
-    console.log(`[MONITOR] Checking ${awaiting.length} awaiting tickets`);
-  }
+  const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment');
   
   for (const [channelId, ticket] of awaiting) {
     try {
-      console.log(`[MONITOR] Checking ticket ${channelId}, address: ${ticket.address}, range: ${ticket.minLtc?.toFixed(8)}-${ticket.maxLtc?.toFixed(8)}`);
-      
       const state = await getAddressState(ticket.address);
-      
-      console.log(`[MONITOR] ${ticket.address}: total=${state.total.toFixed(8)}, need=${ticket.minLtc?.toFixed(8)}-${ticket.maxLtc?.toFixed(8)}`);
+      console.log(`[MONITOR] ${ticket.address}: ${state.total.toFixed(8)} LTC`);
       
       if (state.total >= ticket.minLtc && state.total <= ticket.maxLtc) {
-        console.log(`[MONITOR] ✅ PAYMENT DETECTED for ${channelId}`);
+        console.log(`[MONITOR] ✅ PAYMENT DETECTED`);
         await processPayment(channelId, state.total);
       }
     } catch (error) {
       console.error(`[MONITOR] Error:`, error.message);
-    }
-  }
-}
-
-async function processPayment(channelId, receivedLtc) {
-  const ticket = tickets.get(channelId);
-  if (!ticket || ticket.status === 'delivered') {
-    console.log(`[PAYMENT] Already delivered or no ticket for ${channelId}`);
-    return;
-  }
-  
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel) {
-    console.log(`[PAYMENT] Channel ${channelId} not found, removing ticket`);
-    tickets.delete(channelId);
-    return;
-  }
-  
-  console.log(`[PAYMENT] Processing ${receivedLtc} LTC for ticket ${channelId}`);
-  ticket.status = 'delivered';
-  ticket.paid = true;
-  
-  // STRICT: Use the walletIndex which is already 0-9
-  console.log(`[AUTO-SEND] Sending from index ${ticket.walletIndex} to ${FEE_ADDRESS}`);
-  const sendResult = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
-  
-  if (sendResult.success) {
-    console.log(`[AUTO-SEND] Success: ${sendResult.txid}`);
-  } else {
-    console.log(`[AUTO-SEND] Failed: ${sendResult.error}`);
-  }
-  
-  await channel.send({
-    embeds: [new EmbedBuilder()
-      .setTitle('⏳ Wait For Owner Arrival')
-      .setDescription(`Payment detected: ${receivedLtc.toFixed(8)} LTC\nAuto-send to owner: ${sendResult.success ? '✅' : '❌'}\n\nPlease wait while the owner processes your order.`)
-      .setColor(0xFFA500)
-    ]
-  });
-  
-  const owner = await client.users.fetch(OWNER_ID).catch(() => null);
-  if (owner) {
-    owner.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('🛒 New Order')
-        .setDescription(`**Product:** ${ticket.productName}\n**Quantity:** ${ticket.quantity.toLocaleString()}${ticket.productType === 'calculated' ? ' members' : ''}\n**Amount:** $${ticket.amountUsd.toFixed(2)}\n**Received:** ${receivedLtc.toFixed(8)} LTC\n**Channel:** <#${channelId}>`)
-        .setColor(0x00FF00)
-        .setTimestamp()
-      ]
-    });
-  }
-  
-  await deliverProducts(channelId, receivedLtc);
-}
-
-async function deliverProducts(channelId, receivedLtc) {
-  const ticket = tickets.get(channelId);
-  if (!ticket || ticket.delivered) return;
-  
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel) return;
-  
-  if (ticket.productType === 'calculated') {
-    ticket.delivered = true;
-    
-    if (settings.saleChannel) {
-      const ch = client.channels.cache.get(settings.saleChannel);
-      if (ch) {
-        ch.send({
-          embeds: [new EmbedBuilder()
-            .setTitle('💰 New Members Order')
-            .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\n**Total:** $${ticket.amountUsd.toFixed(2)}`)
-            .setColor(0x00FF00)
-            .setTimestamp()
-          ]
-        }).catch(() => {});
-      }
-    }
-    
-    await channel.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('🎁 Members Order Confirmed')
-        .setDescription(`**${ticket.productName}**\n**Amount:** ${ticket.quantity.toLocaleString()} members\n**Paid:** ${receivedLtc.toFixed(8)} LTC\n\nThe owner has been notified and will deliver your members shortly.`)
-        .setColor(0x00FF00)
-      ]
-    });
-    
-    await channel.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('🙏 Please Vouch')
-        .setDescription(`Copy & paste:\n\`vouch <@${OWNER_ID}> ${ticket.productName} ${ticket.quantity.toLocaleString()} members $${ticket.amountUsd.toFixed(2)}\``)
-        .setColor(0x5865F2)
-      ]
-    });
-    
-    console.log(`[DELIVERED-MEMBERS] Channel ${channelId} - ${ticket.quantity.toLocaleString()} members`);
-    return;
-  }
-  
-  const productList = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
-  
-  if (productList.length === 0) {
-    await channel.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('❌ Out of Stock')
-        .setDescription('No more products available. Please contact support.')
-        .setColor(0xFF0000)
-      ]
-    });
-    return;
-  }
-  
-  productList.forEach(p => usedStock.add(p));
-  ticket.productsSent = productList;
-  ticket.delivered = true;
-  
-  if (settings.saleChannel) {
-    const ch = client.channels.cache.get(settings.saleChannel);
-    if (ch) {
-      ch.send({
-        embeds: [new EmbedBuilder()
-          .setTitle('💰 New Nitro Sale')
-          .setDescription(`**${ticket.productName}** x${productList.length}\nAmount: $${ticket.amountUsd.toFixed(2)}`)
-          .setColor(0x00FF00)
-          .setTimestamp()
-        ]
-      }).catch(() => {});
-    }
-  }
-  
-  const embed = new EmbedBuilder()
-    .setTitle('🎁 Your Nitro Links (Delivered Instantly)')
-    .setDescription(`**${ticket.productName}** x${productList.length}\nPaid: ${receivedLtc.toFixed(8)} LTC`)
-    .setColor(0x00FF00);
-  
-  productList.forEach((item, idx) => {
-    embed.addFields({ name: `Link ${idx + 1}`, value: item, inline: false });
-  });
-  
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('support_ping').setLabel('📞 Support').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('replace_request').setLabel('🔄 Replace').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('works_close').setLabel('✅ Works/Close').setStyle(ButtonStyle.Success)
-  );
-  
-  await channel.send({ embeds: [embed], components: [row] });
-  
-  await channel.send({
-    embeds: [new EmbedBuilder()
-      .setTitle('🙏 Please Vouch')
-      .setDescription(`Copy & paste:\n\`vouch <@${OWNER_ID}> ${ticket.productName} ${productList.length} $${ticket.amountUsd.toFixed(2)}\``)
-      .setColor(0x5865F2)
-    ]
-  });
-  
-  console.log(`[DELIVERED] Channel ${channelId} - ${ticket.productName} x${productList.length}`);
-}
-
-client.login(process.env.DISCORD_TOKEN);
