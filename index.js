@@ -24,8 +24,8 @@ let ltcPrice = 75;
 let settings = { ticketCategory: null, staffRole: null, transcriptChannel: null, saleChannel: null };
 const tickets = new Map();
 const usedStock = new Set();
-const usedIndices = new Set(); // Track which indices are in use
-let currentIndex = 0; // Only use 0-9, wrap around
+const usedIndices = new Set();
+let currentIndex = 0;
 
 const PRODUCTS = {
   nitro_basic_month: { name: 'Nitro Basic Monthly', price: 1.0, stock: ['link1','link2','link3','link4','link5'] },
@@ -35,7 +35,6 @@ const PRODUCTS = {
 };
 
 function getLitecoinAddress(index) {
-  // STRICT: Only indices 0-9
   if (index < 0 || index > 9) {
     console.error(`[ERROR] Invalid index ${index}, forcing to 0`);
     index = 0;
@@ -47,24 +46,22 @@ function getLitecoinAddress(index) {
   const { address } = bitcoin.payments.p2pkh({ pubkey: Buffer.from(child.publicKey), network: LITECOIN });
   const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
   
-  console.log(`[WALLET] Generated address at index ${index}: ${address}`);
+  console.log(`[WALLET] Index ${index}: ${address}`);
   return { address, privateKey: keyPair.toWIF(), index };
 }
 
 function getNextIndex() {
-  // Find next available index 0-9
   for (let i = 0; i < 10; i++) {
     const idx = (currentIndex + i) % 10;
     if (!usedIndices.has(idx)) {
       usedIndices.add(idx);
       currentIndex = (idx + 1) % 10;
-      console.log(`[INDEX] Assigned index ${idx}, used: [${Array.from(usedIndices).join(',')}]`);
+      console.log(`[INDEX] Assigned ${idx}, used: [${Array.from(usedIndices).join(',')}]`);
       return idx;
     }
   }
   
-  // All indices used, reset and use 0
-  console.log(`[INDEX] All indices used, resetting`);
+  console.log(`[INDEX] All used, resetting`);
   usedIndices.clear();
   usedIndices.add(0);
   currentIndex = 1;
@@ -73,49 +70,28 @@ function getNextIndex() {
 
 function releaseIndex(index) {
   usedIndices.delete(index);
-  console.log(`[INDEX] Released index ${index}, used: [${Array.from(usedIndices).join(',')}]`);
+  console.log(`[INDEX] Released ${index}, used: [${Array.from(usedIndices).join(',')}]`);
 }
 
 async function getAddressBalance(address) {
   try {
-    // Use mempool.space API for faster 0-conf detection (no API key needed for mainnet)
-    // Or blockchair with mempool
-    const urls = [
-      `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`,
-      `https://litecoinspace.org/api/address/${address}` // Fallback for mempool
-    ];
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?key=${BLOCKCHAIR_KEY}`;
+    console.log(`[API] Checking: ${address}`);
+    const { data } = await axios.get(url, { timeout: 15000 });
     
-    for (const url of urls) {
-      try {
-        console.log(`[API] Checking: ${url.split('?')[0]}`);
-        const { data } = await axios.get(url, { timeout: 10000 });
-        
-        if (url.includes('blockchair')) {
-          if (!data?.data?.[address]) continue;
-          const addr = data.data[address].address;
-          const balance = addr.balance / 100000000;
-          const received = addr.received / 100000000;
-          const spent = addr.spent / 100000000;
-          const unconfirmed = Math.max(0, received - spent - balance);
-          
-          console.log(`[BLOCKCHAIR] ${address}: Balance=${balance}, Unconfirmed=${unconfirmed}, Total=${balance + unconfirmed}`);
-          return { balance, unconfirmed, total: balance + unconfirmed, source: 'blockchair' };
-        } else {
-          // litecoinspace format
-          const chainBalance = (data.chain_stats?.funded_txo_sum - data.chain_stats?.spent_txo_sum) / 100000000 || 0;
-          const mempoolBalance = (data.mempool_stats?.funded_txo_sum - data.mempool_stats?.spent_txo_sum) / 100000000 || 0;
-          const total = chainBalance + mempoolBalance;
-          
-          console.log(`[LITECOINSPACE] ${address}: Chain=${chainBalance}, Mempool=${mempoolBalance}, Total=${total}`);
-          return { balance: chainBalance, unconfirmed: mempoolBalance, total, source: 'litecoinspace' };
-        }
-      } catch (e) {
-        console.log(`[API] Failed: ${e.message}`);
-        continue;
-      }
+    if (!data?.data?.[address]) {
+      console.log(`[API] No data for ${address}`);
+      return { balance: 0, unconfirmed: 0, total: 0 };
     }
     
-    return { balance: 0, unconfirmed: 0, total: 0 };
+    const addr = data.data[address].address;
+    const balance = addr.balance / 100000000;
+    const received = addr.received / 100000000;
+    const spent = addr.spent / 100000000;
+    const unconfirmed = Math.max(0, received - spent - balance);
+    
+    console.log(`[BALANCE] ${address}: ${balance} + ${unconfirmed} = ${balance + unconfirmed} LTC`);
+    return { balance, unconfirmed, total: balance + unconfirmed };
   } catch (e) {
     console.error(`[API ERROR] ${e.message}`);
     return { balance: 0, unconfirmed: 0, total: 0 };
@@ -125,9 +101,8 @@ async function getAddressBalance(address) {
 async function sendAllLTC(fromIndex, toAddress) {
   try {
     const wallet = getLitecoinAddress(fromIndex);
-    console.log(`[SEND] Sweeping index ${fromIndex} to ${toAddress}`);
+    console.log(`[SEND] Index ${fromIndex} → ${toAddress}`);
     
-    // Get UTXOs
     const url = `https://api.blockchair.com/litecoin/dashboards/address/${wallet.address}?key=${BLOCKCHAIR_KEY}`;
     const { data } = await axios.get(url, { timeout: 15000 });
     
@@ -149,7 +124,7 @@ async function sendAllLTC(fromIndex, toAddress) {
             index: utxo.index,
             nonWitnessUtxo: Buffer.from(txData.data.data[utxo.transaction_hash].raw_transaction, 'hex')
           });
-          totalInput += parseInt(utxo.value);
+          totalInput += parseInt(uto.value);
         }
       } catch (e) { continue; }
     }
@@ -174,7 +149,7 @@ async function sendAllLTC(fromIndex, toAddress) {
     }, { params: { key: BLOCKCHAIR_KEY }, timeout: 15000 });
     
     if (broadcast.data?.data?.transaction_hash) {
-      releaseIndex(fromIndex); // Release index after successful send
+      releaseIndex(fromIndex);
       return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000 };
     }
     
@@ -185,7 +160,7 @@ async function sendAllLTC(fromIndex, toAddress) {
 }
 
 client.once('ready', async () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
+  console.log(`(`✅ Bot logged in as ${client.user.tag}`);
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
@@ -200,10 +175,8 @@ client.once('ready', async () => {
   ];
   
   await client.application.commands.set(commands);
-  
-  // FAST: Check every 3 seconds
   setInterval(checkPayments, 3000);
-  console.log('[SYSTEM] Payment checker started (every 3s)');
+  console.log('[SYSTEM] Started (3s checks)');
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -268,241 +241,21 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     
-    let text = `**Sweep Complete!**\nFound ${results.length} wallets with balance\n\n`;
+    let text = `**Sweep Complete!**\nFound ${results.length} wallets\n\n`;
     for (const r of results) {
       if (r.success) {
-        text += `✅ Index ${r.index}: ${r.balance?.toFixed(8)} LTC → Sent ${r.amount?.toFixed(8)} LTC\nTx: ${r.txid?.slice(0,20)}...\n`;
+        text += `✅ Index ${r.index}: ${r.balance?.toFixed(8)} LTC sent\nTx: ${r.txid?.slice(0,20)}...\n`;
       } else {
-        text += `❌ Index ${r.index}: ${r.balance?.toFixed(8)} LTC - ${r.error}\n`;
+        text += `❌ Index ${r.index}: ${r.error}\n`;
       }
     }
     
-    if (results.length === 0) text += 'No wallets with balance found.';
+    if (results.length === 0) text += 'No balance found.';
     await interaction.editReply({ content: text });
   }
   else if (interaction.commandName === 'balance') {
     const idx = interaction.options.getInteger('index');
-    if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index must be 0-9', flags: MessageFlags.Ephemeral });
-    
-    const wallet = getLitecoinAddress(idx);
-    const bal = await getAddressBalance(wallet.address);
-    
-    await interaction.reply({
-      embeds: [new EmbedBuilder()
-        .setTitle(`💰 Wallet ${idx}`)
-        .setDescription(`Address: \`${wallet.address}\`\nConfirmed: ${bal.balance.toFixed(8)} LTC\nUnconfirmed: ${bal.unconfirmed.toFixed(8)} LTC\n**Total: ${bal.total.toFixed(8)} LTC**`)
-        .setColor(bal.total > 0 ? 0x00FF00 : 0xFF0000)
-      ],
-      flags: MessageFlags.Ephemeral
-    });
-  }
-  else if (interaction.commandName === 'close') {
-    const ticket = tickets.get(interaction.channel.id);
-    if (ticket && settings.transcriptChannel) {
-      const ch = await interaction.guild.channels.fetch(settings.transcriptChannel).catch(() => null);
-      if (ch) ch.send({ 
-        embeds: [new EmbedBuilder()
-/${address}` // Fallback for mempool
-    ];
-    
-    for (const url of urls) {
-      try {
-        console.log(`[API] Checking: ${url.split('?')[0]}`);
-        const { data } = await axios.get(url, { timeout: 10000 });
-        
-        if (url.includes('blockchair')) {
-          if (!data?.data?.[address]) continue;
-          const addr = data.data[address].address;
-          const balance = addr.balance / 100000000;
-          const received = addr.received / 100000000;
-          const spent = addr.spent / 100000000;
-          const unconfirmed = Math.max(0, received - spent - balance);
-          
-          console.log(`[BLOCKCHAIR] ${address}: Balance=${balance}, Unconfirmed=${unconfirmed}, Total=${balance + unconfirmed}`);
-          return { balance, unconfirmed, total: balance + unconfirmed, source: 'blockchair' };
-        } else {
-          // litecoinspace format
-          const chainBalance = (data.chain_stats?.funded_txo_sum - data.chain_stats?.spent_txo_sum) / 100000000 || 0;
-          const mempoolBalance = (data.mempool_stats?.funded_txo_sum - data.mempool_stats?.spent_txo_sum) / 100000000 || 0;
-          const total = chainBalance + mempoolBalance;
-          
-          console.log(`[LITECOINSPACE] ${address}: Chain=${chainBalance}, Mempool=${mempoolBalance}, Total=${total}`);
-          return { balance: chainBalance, unconfirmed: mempoolBalance, total, source: 'litecoinspace' };
-        }
-      } catch (e) {
-        console.log(`[API] Failed: ${e.message}`);
-        continue;
-      }
-    }
-    
-    return { balance: 0, unconfirmed: 0, total: 0 };
-  } catch (e) {
-    console.error(`[API ERROR] ${e.message}`);
-    return { balance: 0, unconfirmed: 0, total: 0 };
-  }
-}
-
-async function sendAllLTC(fromIndex, toAddress) {
-  try {
-    const wallet = getLitecoinAddress(fromIndex);
-    console.log(`[SEND] Sweeping index ${fromIndex} to ${toAddress}`);
-    
-    // Get UTXOs
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${wallet.address}?key=${BLOCKCHAIR_KEY}`;
-    const { data } = await axios.get(url, { timeout: 15000 });
-    
-    if (!data?.data?.[wallet.address]) return { success: false, error: 'No data' };
-    
-    const utxos = data.data[wallet.address].utxo || [];
-    if (utxos.length === 0) return { success: false, error: 'No UTXOs' };
-    
-    const psbt = new bitcoin.Psbt({ network: LITECOIN });
-    let totalInput = 0;
-    
-    for (const utxo of utxos) {
-      try {
-        const txUrl = `https://api.blockchair.com/litecoin/raw/transaction/${utxo.transaction_hash}?key=${BLOCKCHAIR_KEY}`;
-        const txData = await axios.get(txUrl, { timeout: 10000 });
-        if (txData.data?.data?.[utxo.transaction_hash]?.raw_transaction) {
-          psbt.addInput({
-            hash: utxo.transaction_hash,
-            index: utxo.index,
-            nonWitnessUtxo: Buffer.from(txData.data.data[utxo.transaction_hash].raw_transaction, 'hex')
-          });
-          totalInput += parseInt(utxo.value);
-        }
-      } catch (e) { continue; }
-    }
-    
-    if (totalInput === 0) return { success: false, error: 'No inputs' };
-    
-    const fee = 100000;
-    const amount = totalInput - fee;
-    if (amount <= 0) return { success: false, error: 'Too small' };
-    
-    psbt.addOutput({ address: toAddress, value: amount });
-    const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
-    
-    for (let i = 0; i < psbt.inputCount; i++) {
-      try { psbt.signInput(i, keyPair); } catch (e) {}
-    }
-    
-    psbt.finalizeAllInputs();
-    
-    const broadcast = await axios.post('https://api.blockchair.com/litecoin/push/transaction', {
-      data: psbt.extractTransaction().toHex()
-    }, { params: { key: BLOCKCHAIR_KEY }, timeout: 15000 });
-    
-    if (broadcast.data?.data?.transaction_hash) {
-      releaseIndex(fromIndex); // Release index after successful send
-      return { success: true, txid: broadcast.data.data.transaction_hash, amount: amount / 100000000 };
-    }
-    
-    return { success: false, error: 'Broadcast failed' };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
-client.once('ready', async () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
-  
-  const commands = [
-    new SlashCommandBuilder().setName('panel').setDescription('Spawn shop panel (Owner)'),
-    new SlashCommandBuilder().setName('ticketcategory').setDescription('Set ticket category (Owner)').addStringOption(o => o.setName('id').setDescription('Category ID').setRequired(true)),
-    new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role (Owner)').addStringOption(o => o.setName('id').setDescription('Role ID').setRequired(true)),
-    new SlashCommandBuilder().setName('transcriptchannel').setDescription('Set transcript channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
-    new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel (Owner)').addStringOption(o => o.setName('id').setDescription('Channel ID').setRequired(true)),
-    new SlashCommandBuilder().setName('send').setDescription('Send all LTC to address (Owner)').addStringOption(o => o.setName('address').setDescription('LTC address').setRequired(true)),
-    new SlashCommandBuilder().setName('close').setDescription('Close ticket (Owner/Staff)'),
-    new SlashCommandBuilder().setName('balance').setDescription('Check wallet balance (Owner)').addIntegerOption(o => o.setName('index').setDescription('Wallet index 0-9').setRequired(true)),
-    new SlashCommandBuilder().setName('oauth2').setDescription('Get bot invite (Owner)')
-  ];
-  
-  await client.application.commands.set(commands);
-  
-  // FAST: Check every 3 seconds
-  setInterval(checkPayments, 3000);
-  console.log('[SYSTEM] Payment checker started (every 3s)');
-});
-
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  
-  const isOwner = interaction.user.id === OWNER_ID;
-  const isStaff = settings.staffRole && interaction.member?.roles?.cache?.has(settings.staffRole);
-  
-  if (!isOwner && !['close'].includes(interaction.commandName)) {
-    return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
-  }
-  
-  if (interaction.commandName === 'close' && !isOwner && !isStaff) {
-    return interaction.reply({ content: '❌ Owner or Staff only', flags: MessageFlags.Ephemeral });
-  }
-  
-  if (interaction.commandName === 'panel') {
-    const embed = new EmbedBuilder()
-      .setTitle('🏪 Hello welcome to Nitro Shop')
-      .setDescription('• Lifetime warranty\n• Refund if revoke\n• Refund if broken')
-      .setColor(0x5865F2);
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('open_ticket').setLabel('🛒 Purchase Nitro').setStyle(ButtonStyle.Success)
-    );
-    await interaction.reply({ embeds: [embed], components: [row] });
-  }
-  else if (interaction.commandName === 'ticketcategory') { 
-    settings.ticketCategory = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Category set', flags: MessageFlags.Ephemeral }); 
-  }
-  else if (interaction.commandName === 'staffroleid') { 
-    settings.staffRole = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Staff role set', flags: MessageFlags.Ephemeral }); 
-  }
-  else if (interaction.commandName === 'transcriptchannel') { 
-    settings.transcriptChannel = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Transcript channel set', flags: MessageFlags.Ephemeral }); 
-  }
-  else if (interaction.commandName === 'salechannel') { 
-    settings.saleChannel = interaction.options.getString('id'); 
-    await interaction.reply({ content: '✅ Sales channel set', flags: MessageFlags.Ephemeral }); 
-  }
-  else if (interaction.commandName === 'send') {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const address = interaction.options.getString('address');
-    
-    try { 
-      bitcoin.address.toOutputScript(address, LITECOIN); 
-    } catch (e) { 
-      return interaction.editReply({ content: '❌ Invalid LTC address!' }); 
-    }
-    
-    await interaction.editReply({ content: '🔄 Scanning wallets 0-9...' });
-    
-    const results = [];
-    for (let i = 0; i < 10; i++) {
-      const wallet = getLitecoinAddress(i);
-      const bal = await getAddressBalance(wallet.address);
-      if (bal.total > 0.001) {
-        const result = await sendAllLTC(i, address);
-        results.push({ index: i, ...result, balance: bal.total });
-      }
-    }
-    
-    let text = `**Sweep Complete!**\nFound ${results.length} wallets with balance\n\n`;
-    for (const r of results) {
-      if (r.success) {
-        text += `✅ Index ${r.index}: ${r.balance?.toFixed(8)} LTC → Sent ${r.amount?.toFixed(8)} LTC\nTx: ${r.txid?.slice(0,20)}...\n`;
-      } else {
-        text += `❌ Index ${r.index}: ${r.balance?.toFixed(8)} LTC - ${r.error}\n`;
-      }
-    }
-    
-    if (results.length === 0) text += 'No wallets with balance found.';
-    await interaction.editReply({ content: text });
-  }
-  else if (interaction.commandName === 'balance') {
-    const idx = interaction.options.getInteger('index');
-    if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index must be 0-9', flags: MessageFlags.Ephemeral });
+    if (idx < 0 || idx > 9) return interaction.reply({ content: '❌ Index 0-9 only', flags: MessageFlags.Ephemeral });
     
     const wallet = getLitecoinAddress(idx);
     const bal = await getAddressBalance(wallet.address);
@@ -532,11 +285,9 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
     
-    if (ticket?.walletIndex !== undefined) {
-      releaseIndex(ticket.walletIndex);
-    }
-    
+    if (ticket?.walletIndex !== undefined) releaseIndex(ticket.walletIndex);
     tickets.delete(interaction.channel.id);
+    
     await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
     await interaction.channel.delete();
   }
@@ -554,7 +305,6 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton() && interaction.customId === 'open_ticket') {
     if (!settings.ticketCategory) return interaction.reply({ content: '❌ Not setup', flags: MessageFlags.Ephemeral });
     
-    // Check existing
     for (const [chId, t] of tickets) {
       if (t.userId === interaction.user.id && t.status !== 'delivered') {
         const ch = interaction.guild.channels.cache.get(chId);
@@ -595,7 +345,6 @@ client.on('interactionCreate', async (interaction) => {
       components: [row] 
     });
     
-    // Store wallet info immediately
     tickets.set(channel.id, { 
       userId: interaction.user.id, 
       status: 'selecting', 
@@ -605,7 +354,7 @@ client.on('interactionCreate', async (interaction) => {
       privateKey: wallet.privateKey
     });
     
-    console.log(`[TICKET] Created ${channel.id} with index ${index}, address ${wallet.address}`);
+    console.log(`[TICKET] ${channel.id} using index ${index}`);
     await interaction.reply({ content: `✅ ${channel}`, flags: MessageFlags.Ephemeral });
   }
   
@@ -656,7 +405,7 @@ client.on('interactionCreate', async (interaction) => {
     ticket.maxLtc = parseFloat(totalLtc) + toleranceLtc + 0.001;
     ticket.status = 'awaiting_payment';
     
-    console.log(`[TICKET] ${interaction.channel.id} awaiting payment: ${ticket.address} | ${totalLtc} LTC | Range: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)}`);
+    console.log(`[AWAITING] ${ticket.address} | Need: ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)} LTC`);
     
     await interaction.reply({ 
       embeds: [new EmbedBuilder()
@@ -668,16 +417,15 @@ client.on('interactionCreate', async (interaction) => {
           { name: '⚡ Index', value: `${ticket.walletIndex}` }
         )
         .setColor(0xFFD700)
-        .setFooter({ text: 'Send LTC now - 0-conf detection active' })
+        .setFooter({ text: 'Send LTC - 0-conf detection active' })
       ] 
     });
     
-    // Immediate balance check
+    // Immediate check
     setTimeout(async () => {
       const bal = await getAddressBalance(ticket.address);
-      console.log(`[INIT CHECK] ${ticket.address}: ${bal.total} LTC`);
+      console.log(`[INIT] ${ticket.address}: ${bal.total} LTC`);
       if (bal.total >= ticket.minLtc) {
-        console.log(`[INIT CHECK] Payment already there!`);
         await processPayment(interaction.channel.id, bal.total);
       }
     }, 2000);
@@ -694,37 +442,34 @@ async function processPayment(channelId, amount) {
     return;
   }
   
-  console.log(`[PAYMENT] Processing ${amount} LTC for ticket ${channelId}`);
+  console.log(`[PAYMENT] ${amount} LTC detected in ${channelId}`);
   ticket.status = 'delivered';
   
-  // Send to owner
   const result = await sendAllLTC(ticket.walletIndex, FEE_ADDRESS);
-  console.log(`[AUTO-SEND] ${result.success ? 'SUCCESS' : 'FAILED'}: ${result.txid || result.error}`);
+  console.log(`[SEND] ${result.success ? 'OK' : 'FAIL'}: ${result.txid || result.error}`);
   
   await channel.send({ 
     embeds: [new EmbedBuilder()
       .setTitle('⏳ Wait For Owner Arrival')
-      .setDescription(`Payment detected: ${amount.toFixed(8)} LTC\nAuto-sent to owner: ${result.success ? '✅' : '❌'}\n\nPlease wait for owner to deliver.`)
+      .setDescription(`Payment: ${amount.toFixed(8)} LTC\nAuto-send: ${result.success ? '✅' : '❌'}\n\nWait for owner delivery.`)
       .setColor(0xFFA500)
     ] 
   });
   
-  // Notify owner
   const owner = await client.users.fetch(OWNER_ID).catch(() => null);
   if (owner) {
     owner.send({ 
-      content: `🛒 **New Order**\nProduct: ${ticket.productName}\nQty: ${ticket.quantity}\nPaid: $${ticket.amountUsd.toFixed(2)} (${amount.toFixed(8)} LTC)\nChannel: <#${channelId}>` 
+      content: `🛒 New Order\n${ticket.productName} x${ticket.quantity}\n$${ticket.amountUsd.toFixed(2)} (${amount.toFixed(8)} LTC)\n<#${channelId}>` 
     });
   }
   
-  // Deliver
   const links = PRODUCTS[ticket.product].stock.filter(s => !usedStock.has(s)).slice(0, ticket.quantity);
   links.forEach(l => usedStock.add(l));
   
   await channel.send({ 
     embeds: [new EmbedBuilder()
       .setTitle('🎁 Your Nitro Links')
-      .setDescription(links.map((l, i) => `**${i + 1}.** ${l}`).join('\n'))
+      .setDescription(links.map((l, i) => `${i + 1}. ${l}`).join('\n'))
       .setColor(0x00FF00)
     ] 
   });
@@ -737,7 +482,6 @@ async function processPayment(channelId, amount) {
           .setTitle('💰 Sale')
           .setDescription(`${ticket.productName} x${ticket.quantity} - $${ticket.amountUsd.toFixed(2)}`)
           .setColor(0x00FF00)
-          .setTimestamp()
         ] 
       });
     }
@@ -746,13 +490,13 @@ async function processPayment(channelId, amount) {
 
 async function checkPayments() {
   const awaiting = Array.from(tickets.entries()).filter(([_, t]) => t.status === 'awaiting_payment');
-  
   if (awaiting.length === 0) return;
-  console.log(`[CHECK] Checking ${awaiting.length} tickets...`);
+  
+  console.log(`[CHECK] ${awaiting.length} tickets`);
   
   for (const [channelId, ticket] of awaiting) {
     const bal = await getAddressBalance(ticket.address);
-    console.log(`[CHECK] ${ticket.address}: ${bal.total.toFixed(8)} LTC (need ${ticket.minLtc.toFixed(8)}-${ticket.maxLtc.toFixed(8)})`);
+    console.log(`[CHECK] ${ticket.address}: ${bal.total.toFixed(8)} LTC`);
     
     if (bal.total >= ticket.minLtc && bal.total <= ticket.maxLtc) {
       await processPayment(channelId, bal.total);
