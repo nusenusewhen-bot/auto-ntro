@@ -175,7 +175,7 @@ client.once('ready', async () => {
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Shop panel'),
     new SlashCommandBuilder().setName('ticketcategory').setDescription('Set category').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
-    new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role').addStringOption(o => o.setName('id'). bot is detecting balances correctly now:
+    .addStringOption(o => o.setName('id').setDescription('Role ID').setRequired(true))
 - Index 0: `0.07153965 LTC` ✅
 - Index 1: `0.01883948 LTC` ✅
 
