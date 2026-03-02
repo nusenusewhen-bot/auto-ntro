@@ -1,7 +1,6 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js');
 const { initWallet, sendAllLTC, getBalanceAtIndex, generateAddress } = require('./wallet');
-const { getLtcPriceUSD } = require('./blockchain');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -21,20 +20,18 @@ if (!walletInitialized) {
 client.once('ready', async () => {
   console.log(`[READY] ${client.user.tag}`);
   
-  const commands = [
+  await client.application.commands.set([
     new SlashCommandBuilder()
       .setName('send')
-      .setDescription('Send all LTC to address (Owner only)')
+      .setDescription('Send all LTC from all indices')
       .addStringOption(o => o.setName('address').setDescription('LTC Address').setRequired(true))
-  ];
+  ]);
   
-  await client.application.commands.set(commands);
   console.log('[COMMANDS] /send ready');
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'send') return;
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'send') return;
   if (interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
   }
@@ -43,30 +40,27 @@ client.on('interactionCreate', async (interaction) => {
   const address = interaction.options.getString('address').trim();
   
   if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
-    return interaction.editReply({ content: '❌ Invalid LTC address' });
+    return interaction.editReply({ content: '❌ Invalid address' });
   }
 
   let results = [];
   
-  // Send from indices 0, 1, 2
   for (let i = 0; i < 3; i++) {
     const balance = await getBalanceAtIndex(i, true);
-    
     if (balance <= 0) {
-      results.push(`❌ [${i}] No balance (${generateAddress(i)})`);
+      results.push(`❌ [${i}] No balance`);
       continue;
     }
-
     const result = await sendAllLTC(i, address);
-    
-    if (result.success) {
-      results.push(`✅ [${i}] Sent ${result.amountSent} LTC\nTX: ${result.txid}`);
-    } else {
-      results.push(`❌ [${i}] ${result.error}`);
-    }
+    results.push(result.success 
+      ? `✅ [${i}] Sent ${result.amountSent} LTC\nTX: ${result.txid}`
+      : `❌ [${i}] ${result.error}`
+    );
   }
   
-  await interaction.editReply({ content: results.join('\n\n') || 'No funds found' });
+  await interaction.editReply({ 
+    embeds: [new EmbedBuilder().setTitle('💰 Results').setDescription(results.join('\n\n')).setColor(0x00FF00)] 
+  });
 });
 
 client.login(process.env.DISCORD_TOKEN);
