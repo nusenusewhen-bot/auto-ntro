@@ -1,3 +1,4 @@
+// index.js - Complete Ticket Bot
 require('dotenv').config();
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder, PermissionFlagsBits, ChannelType, Events, SlashCommandBuilder } = require('discord.js');
 const Database = require('better-sqlite3');
@@ -11,10 +12,8 @@ const client = new Client({
   ]
 });
 
-// Initialize database
 const db = new Database('ticketbot.db');
 
-// Create tables
 db.exec(`
   CREATE TABLE IF NOT EXISTS settings (
     guild_id TEXT PRIMARY KEY,
@@ -38,7 +37,6 @@ db.exec(`
   );
 `);
 
-// Helper functions
 const getSettings = (guildId) => {
   return db.prepare('SELECT * FROM settings WHERE guild_id = ?').get(guildId);
 };
@@ -75,7 +73,6 @@ const deleteTicket = (channelId) => {
   db.prepare('DELETE FROM tickets WHERE channel_id = ?').run(channelId);
 };
 
-// Commands registration
 const commands = [
   new SlashCommandBuilder()
     .setName('ticketcategory')
@@ -106,7 +103,6 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
-// Ready event
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   
@@ -118,10 +114,8 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// Interaction handler
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Slash Commands
     if (interaction.isChatInputCommand()) {
       const { commandName, guildId } = interaction;
       
@@ -202,7 +196,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     
-    // Button Interactions
     if (interaction.isButton()) {
       const { customId, guild, user } = interaction;
       
@@ -255,25 +248,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
           
         const explainInput = new TextInputBuilder()
           .setCustomId('explanation')
-          .setLabel('Explanation')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setMaxLength(1000);
-          
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(helpInput),
-          new ActionRowBuilder().addComponents(explainInput)
-        );
-        
-        await interaction.showModal(modal);
-      }
-      
-      if (customId === 'close_ticket') {
-        const ticket = getTicket(interaction.channel.id);
-        if (!ticket) return interaction.reply({ content: '❌ This isrun(channelId);
+ data.help_topic || null, 
+         data.explanation || null, data.auto_msg_sent || 0);
 };
 
-// Commands registration
+const getTicket = (channelId) => {
+  return db.prepare('SELECT * FROM tickets WHERE channel_id = ?').get(channelId);
+};
+
+const markAutoMsgSent = (channelId) => {
+  db.prepare('UPDATE tickets SET auto_msg_sent = 1 WHERE channel_id = ?').run(channelId);
+};
+
+const deleteTicket = (channelId) => {
+  db.prepare('DELETE FROM tickets WHERE channel_id = ?').run(channelId);
+};
+
 const commands = [
   new SlashCommandBuilder()
     .setName('ticketcategory')
@@ -304,7 +294,6 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
-// Ready event
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   
@@ -316,10 +305,8 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// Interaction handler
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Slash Commands
     if (interaction.isChatInputCommand()) {
       const { commandName, guildId } = interaction;
       
@@ -400,7 +387,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     
-    // Button Interactions
     if (interaction.isButton()) {
       const { customId, guild, user } = interaction;
       
@@ -479,7 +465,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     
-    // Modal Submissions
     if (interaction.isModalSubmit()) {
       const { customId, guild, user, fields } = interaction;
       const settings = getSettings(guild.id);
@@ -509,7 +494,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         };
       }
       
-      // Create ticket channel
       const channelName = ticketType === 'purchase' 
         ? `purchase-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 20)
         : `support-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 20);
@@ -534,7 +518,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           permissionOverwrites: permissions
         });
         
-        // Save ticket to database
         createTicket({
           channel_id: channel.id,
           guild_id: guild.id,
@@ -544,7 +527,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           auto_msg_sent: 0
         });
         
-        // Send ticket info embed
         const infoEmbed = new EmbedBuilder()
           .setTitle(ticketType === 'purchase' ? '🛒 Purchase Ticket' : '🎧 Support Ticket')
           .setColor(ticketType === 'purchase' ? 0x5865F2 : 0x57F287)
@@ -579,16 +561,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
         
         await interaction.reply({ content: `✅ Your ticket has been created: ${channel}`, ephemeral: true });
         
-        // Auto-message for purchase tickets only (after 10 seconds, once per ticket)
         if (ticketType === 'purchase') {
           setTimeout(async () => {
             try {
               const ticketCheck = getTicket(channel.id);
-              if (ticketCheck && !ticketCheck.auto_msg_sent) {
-                const ltcAddress = 'LeDdjh2BDbPkrhG2pkWBkorun(channelId);
+              if data.help_topic || null, 
+         data.explanation || null, data.auto_msg_sent || 0);
 };
 
-// Commands registration
+const getTicket = (channelId) => {
+  return db.prepare('SELECT * FROM tickets WHERE channel_id = ?').get(channelId);
+};
+
+const markAutoMsgSent = (channelId) => {
+  db.prepare('UPDATE tickets SET auto_msg_sent = 1 WHERE channel_id = ?').run(channelId);
+};
+
+const deleteTicket = (channelId) => {
+  db.prepare('DELETE FROM tickets WHERE channel_id = ?').run(channelId);
+};
+
 const commands = [
   new SlashCommandBuilder()
     .setName('ticketcategory')
@@ -619,7 +611,6 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
-// Ready event
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   
@@ -631,10 +622,8 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// Interaction handler
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Slash Commands
     if (interaction.isChatInputCommand()) {
       const { commandName, guildId } = interaction;
       
@@ -715,7 +704,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     
-    // Button Interactions
     if (interaction.isButton()) {
       const { customId, guild, user } = interaction;
       
@@ -794,7 +782,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     
-    // Modal Submissions
     if (interaction.isModalSubmit()) {
       const { customId, guild, user, fields } = interaction;
       const settings = getSettings(guild.id);
@@ -824,7 +811,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         };
       }
       
-      // Create ticket channel
       const channelName = ticketType === 'purchase' 
         ? `purchase-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 20)
         : `support-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 20);
@@ -849,7 +835,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           permissionOverwrites: permissions
         });
         
-        // Save ticket to database
         createTicket({
           channel_id: channel.id,
           guild_id: guild.id,
@@ -859,7 +844,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           auto_msg_sent: 0
         });
         
-        // Send ticket info embed
         const infoEmbed = new EmbedBuilder()
           .setTitle(ticketType === 'purchase' ? '🛒 Purchase Ticket' : '🎧 Support Ticket')
           .setColor(ticketType === 'purchase' ? 0x5865F2 : 0x57F287)
@@ -894,7 +878,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         
         await interaction.reply({ content: `✅ Your ticket has been created: ${channel}`, ephemeral: true });
         
-        // Auto-message for purchase tickets only (after 10 seconds, once per ticket)
         if (ticketType === 'purchase') {
           setTimeout(async () => {
             try {
@@ -902,7 +885,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
               if (ticketCheck && !ticketCheck.auto_msg_sent) {
                 const ltcAddress = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
                 
-                // Send embed with explanation
                 const autoEmbed = new EmbedBuilder()
                   .setTitle('🤖 Bot Helper')
                   .setDescription(`Hello are you here to buy while the owner is offline? I am his Bot Helper, what you can do is send the money to this address if you're paying LTC:
@@ -911,13 +893,8 @@ After you sent that, send screenshots and when owner comes he will give you the 
                   .setColor(0xFEE75C)
                   .setTimestamp();
                 
-                // Send the embed first
                 await channel.send({ embeds: [autoEmbed] });
-                
-                // Then send the plain address as a separate message (easily copyable on mobile)
-                await channel.send({ 
-                  content: `📋 **LTC Address (Tap to copy):**\n\`${ltcAddress}\``
-                });
+                await channel.send({ content: `📋 **LTC Address (Tap to copy):**\n\`${ltcAddress}\`` });
                 
                 markAutoMsgSent(channel.id);
               }
@@ -943,7 +920,6 @@ After you sent that, send screenshots and when owner comes he will give you the 
   }
 });
 
-// Error handling
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
