@@ -1,7 +1,7 @@
 {
   "name": "nitro-shop-bot",
   "version": "1.0.0",
-  "description": "Nitro Shop Auto-Delivery Bot",
+  "description": "LTC Send Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -15,7 +15,8 @@
     "bip32": "^4.0.0",
     "ecpair": "^2.1.0",
     "dotenv": "^16.3.1",
-    "better-sqlite3": "^9.4.3"
+    "better-sqlite3": "^9.4.3",
+    "hdkey": "^2.1.0"
   },
   "engines": {
     "node": ">=18.0.0"
