@@ -4,7 +4,7 @@ const { initWallet, sendAllLTC, getBalanceAtIndex, generateAddress } = require('
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-const OWNER_ID = process.env.OWNER_ID || '1459833646130401429';
+const OWNER_ID = '1459833646130401429';
 
 if (!process.env.BOT_MNEMONIC) {
   console.error('❌ BOT_MNEMONIC not set!');
