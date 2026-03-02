@@ -1,8 +1,11 @@
+# .gitignore
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .env
+database.db
+*.db
 .DS_Store
 Thumbs.db
 .vscode/
