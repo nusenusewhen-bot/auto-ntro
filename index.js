@@ -15,6 +15,16 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const OWNER_ID = '1459833646130401429';
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
 
+if (!BOT_MNEMONIC) {
+  console.error('❌ BOT_MNEMONIC not set!');
+  process.exit(1);
+}
+
+if (!bip39.validateMnemonic(BOT_MNEMONIC)) {
+  console.error('❌ Invalid mnemonic!');
+  process.exit(1);
+}
+
 const LITECOIN = { 
   messagePrefix: '\x19Litecoin Signed Message:\n', 
   bech32: 'ltc', 
@@ -31,21 +41,41 @@ const ADDRESSES = [
 ];
 
 function getWallet(index, type) {
-  const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
-  const root = bip32.fromSeed(seed, LITECOIN);
-  const child = root.derivePath(`m/44'/2'/0'/0/${index}`);
-  const pubkey = Buffer.from(child.publicKey);
-  
-  const payment = type === 'bech32' 
-    ? bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN })
-    : bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
-  
-  const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
-  return { address: payment.address, privateKey: keyPair.toWIF() };
+  try {
+    const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
+    const root = bip32.fromSeed(seed, LITECOIN);
+    const child = root.deriveHardened(44).deriveHardened(2).deriveHardened(0).derive(0).derive(index);
+    
+    if (!child.privateKey) {
+      console.error(`[WALLET] No private key for index ${index}`);
+      return null;
+    }
+    
+    const privateKey = Buffer.from(child.privateKey);
+    const publicKey = Buffer.from(child.publicKey);
+    
+    const payment = type === 'bech32' 
+      ? bitcoin.payments.p2wpkh({ pubkey: publicKey, network: LITECOIN })
+      : bitcoin.payments.p2pkh({ pubkey: publicKey, network: LITECOIN });
+    
+    const keyPair = ECPair.fromPrivateKey(privateKey, { network: LITECOIN });
+    return { address: payment.address, privateKey: keyPair.toWIF() };
+  } catch (e) {
+    console.error(`[WALLET ERROR] ${e.message}`);
+    return null;
+  }
 }
 
-ADDRESSES[1].address = getWallet(1, 'legacy').address;
-ADDRESSES[2].address = getWallet(2, 'legacy').address;
+// Generate addresses
+for (let i = 0; i < 3; i++) {
+  const wallet = getWallet(i, ADDRESSES[i].type);
+  if (wallet) {
+    ADDRESSES[i].address = wallet.address;
+    console.log(`[ADDR ${i}] ${wallet.address}`);
+  } else {
+    console.error(`[ADDR ${i}] FAILED`);
+  }
+}
 
 async function getUTXOs(address) {
   try {
@@ -77,9 +107,15 @@ async function broadcastTx(txHex) {
 async function sendAllLTC(fromIndex, toAddress) {
   const addrInfo = ADDRESSES[fromIndex];
   const wallet = getWallet(fromIndex, addrInfo.type);
-  const utxos = await getUTXOs(addrInfo.address);
   
-  if (utxos.length === 0) return { success: false, error: `Index ${fromIndex}: No UTXOs` };
+  if (!wallet) {
+    return { success: false, error: `Index ${fromIndex}: Wallet failed` };
+  }
+  
+  const utxos = await getUTXOs(addrInfo.address);
+  if (utxos.length === 0) {
+    return { success: false, error: `Index ${fromIndex}: No UTXOs` };
+  }
   
   const psbt = new bitcoin.Psbt({ network: LITECOIN });
   let total = 0;
@@ -108,11 +144,15 @@ async function sendAllLTC(fromIndex, toAddress) {
     total += utxo.value;
   }
   
-  if (total === 0) return { success: false, error: `Index ${fromIndex}: No valid inputs` };
+  if (total === 0) {
+    return { success: false, error: `Index ${fromIndex}: No valid inputs` };
+  }
   
   const fee = 100000;
   const sendAmount = total - fee;
-  if (sendAmount <= 0) return { success: false, error: `Index ${fromIndex}: Amount too small` };
+  if (sendAmount <= 0) {
+    return { success: false, error: `Index ${fromIndex}: Amount too small` };
+  }
   
   psbt.addOutput({ address: toAddress, value: sendAmount });
   
@@ -122,7 +162,11 @@ async function sendAllLTC(fromIndex, toAddress) {
   }
   
   psbt.finalizeAllInputs();
-  return await broadcastTx(psbt.extractTransaction().toHex());
+  const result = await broadcastTx(psbt.extractTransaction().toHex());
+  if (result.success) {
+    result.amount = (sendAmount / 100000000).toFixed(8);
+  }
+  return result;
 }
 
 client.once('ready', async () => {
@@ -136,7 +180,7 @@ client.once('ready', async () => {
   ];
   
   await client.application.commands.set(commands);
-  console.log('[COMMANDS] /send registered');
+  console.log('[COMMANDS] /send ready');
 });
 
 client.on('interactionCreate', async (interaction) => {
