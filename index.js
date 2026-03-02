@@ -15,12 +15,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const OWNER_ID = '1459833646130401429';
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
 
-if (!BOT_MNEMONIC) {
-  console.error('❌ BOT_MNEMONIC not set!');
-  process.exit(1);
-}
-
-if (!bip39.validateMnemonic(BOT_MNEMONIC)) {
+if (!BOT_MNEMONIC || !bip39.validateMnemonic(BOT_MNEMONIC)) {
   console.error('❌ Invalid mnemonic!');
   process.exit(1);
 }
@@ -34,48 +29,47 @@ const LITECOIN = {
   wif: 0xb0 
 };
 
-const ADDRESSES = [
-  { index: 0, address: 'Lc1m5wtQ8g9mJJP9cV1Db3S7DCxuot98CU', type: 'bech32' },
-  { index: 1, address: null, type: 'legacy' },
-  { index: 2, address: null, type: 'legacy' }
-];
+// Cache wallets so we only generate once
+const WALLETS = {};
 
-function getWallet(index, type) {
-  try {
-    const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
-    const root = bip32.fromSeed(seed, LITECOIN);
-    const child = root.deriveHardened(44).deriveHardened(2).deriveHardened(0).derive(0).derive(index);
-    
-    if (!child.privateKey) {
-      console.error(`[WALLET] No private key for index ${index}`);
-      return null;
+function generateWallets() {
+  const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
+  const root = bip32.fromSeed(seed, LITECOIN);
+  
+  for (let i = 0; i < 3; i++) {
+    try {
+      const child = root.derivePath(`m/44'/2'/0'/0/${i}`);
+      
+      if (!child.privateKey) {
+        console.error(`[WALLET ${i}] No private key`);
+        continue;
+      }
+      
+      const privateKey = Buffer.from(child.privateKey);
+      const publicKey = Buffer.from(child.publicKey);
+      const type = i === 0 ? 'bech32' : 'legacy';
+      
+      const payment = type === 'bech32' 
+        ? bitcoin.payments.p2wpkh({ pubkey: publicKey, network: LITECOIN })
+        : bitcoin.payments.p2pkh({ pubkey: publicKey, network: LITECOIN });
+      
+      const keyPair = ECPair.fromPrivateKey(privateKey, { network: LITECOIN });
+      
+      WALLETS[i] = {
+        address: payment.address,
+        privateKey: keyPair.toWIF(),
+        type: type
+      };
+      
+      console.log(`[WALLET ${i}] ${payment.address}`);
+    } catch (e) {
+      console.error(`[WALLET ${i}] Error: ${e.message}`);
     }
-    
-    const privateKey = Buffer.from(child.privateKey);
-    const publicKey = Buffer.from(child.publicKey);
-    
-    const payment = type === 'bech32' 
-      ? bitcoin.payments.p2wpkh({ pubkey: publicKey, network: LITECOIN })
-      : bitcoin.payments.p2pkh({ pubkey: publicKey, network: LITECOIN });
-    
-    const keyPair = ECPair.fromPrivateKey(privateKey, { network: LITECOIN });
-    return { address: payment.address, privateKey: keyPair.toWIF() };
-  } catch (e) {
-    console.error(`[WALLET ERROR] ${e.message}`);
-    return null;
   }
 }
 
-// Generate addresses
-for (let i = 0; i < 3; i++) {
-  const wallet = getWallet(i, ADDRESSES[i].type);
-  if (wallet) {
-    ADDRESSES[i].address = wallet.address;
-    console.log(`[ADDR ${i}] ${wallet.address}`);
-  } else {
-    console.error(`[ADDR ${i}] FAILED`);
-  }
-}
+// Generate once on startup
+generateWallets();
 
 async function getUTXOs(address) {
   try {
@@ -104,17 +98,15 @@ async function broadcastTx(txHex) {
   }
 }
 
-async function sendAllLTC(fromIndex, toAddress) {
-  const addrInfo = ADDRESSES[fromIndex];
-  const wallet = getWallet(fromIndex, addrInfo.type);
-  
+async function sendAllLTC(index, toAddress) {
+  const wallet = WALLETS[index];
   if (!wallet) {
-    return { success: false, error: `Index ${fromIndex}: Wallet failed` };
+    return { success: false, error: `Index ${index}: Wallet not loaded` };
   }
   
-  const utxos = await getUTXOs(addrInfo.address);
+  const utxos = await getUTXOs(wallet.address);
   if (utxos.length === 0) {
-    return { success: false, error: `Index ${fromIndex}: No UTXOs` };
+    return { success: false, error: `Index ${index}: No UTXOs` };
   }
   
   const psbt = new bitcoin.Psbt({ network: LITECOIN });
@@ -125,7 +117,7 @@ async function sendAllLTC(fromIndex, toAddress) {
     const raw = await getRawTx(utxo.txid);
     if (!raw) continue;
     
-    if (addrInfo.type === 'bech32') {
+    if (wallet.type === 'bech32') {
       psbt.addInput({
         hash: utxo.txid,
         index: utxo.vout,
@@ -145,13 +137,13 @@ async function sendAllLTC(fromIndex, toAddress) {
   }
   
   if (total === 0) {
-    return { success: false, error: `Index ${fromIndex}: No valid inputs` };
+    return { success: false, error: `Index ${index}: No valid inputs` };
   }
   
   const fee = 100000;
   const sendAmount = total - fee;
   if (sendAmount <= 0) {
-    return { success: false, error: `Index ${fromIndex}: Amount too small` };
+    return { success: false, error: `Index ${index}: Amount too small` };
   }
   
   psbt.addOutput({ address: toAddress, value: sendAmount });
