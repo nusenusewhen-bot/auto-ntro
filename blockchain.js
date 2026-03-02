@@ -50,4 +50,151 @@ async function blockchairRequestFree(endpoint) {
 }
 
 async function getAddressBalance(address) {
-  const data = await
+  const data = await blockchairRequest(`/dashboards/address/${address}`);
+  
+  if (!data || !data[address]) {
+    return { confirmed: 0, unconfirmed: 0, total: 0 };
+  }
+  
+  const addressData = data[address];
+  const balance = addressData.address.balance || 0;
+  
+  let unconfirmed = 0;
+  if (addressData.utxo) {
+    unconfirmed = addressData.utxo
+      .filter(u => u.block_id === -1 && !u.is_spent)
+      .reduce((sum, u) => sum + u.value, 0);
+  }
+  
+  return {
+    confirmed: (balance - unconfirmed) / 1e8,
+    unconfirmed: unconfirmed / 1e8,
+    total: balance / 1e8,
+    source: usePaidPlan ? 'blockchair-paid' : 'blockchair-free'
+  };
+}
+
+async function getAddressUTXOs(address) {
+  const data = await blockchairRequest(`/dashboards/address/${address}`);
+  
+  if (!data || !data[address]?.utxo) {
+    return [];
+  }
+  
+  return data[address].utxo
+    .filter(u => !u.is_spent)
+    .map(u => ({
+      txid: u.transaction_hash,
+      vout: u.index,
+      value: parseInt(u.value),
+      confirmations: u.block_id > 0 ? 1 : 0
+    }));
+}
+
+async function getTransactionHex(txid) {
+  console.log(`[TX] Fetching hex for ${txid}`);
+  
+  if (BLOCKCHAIR_KEY && usePaidPlan) {
+    try {
+      const url = `${BASE_URL}/raw/transaction/${txid}?key=${BLOCKCHAIR_KEY}`;
+      const res = await axios.get(url, { timeout: 30000 });
+      if (res.data?.data?.[txid]?.raw_transaction) {
+        return res.data.data[txid].raw_transaction;
+      }
+    } catch (err) {
+      if (err.response?.status === 402 || err.response?.status === 429) usePaidPlan = false;
+    }
+    await delay(100);
+  }
+  
+  try {
+    const url = `${BASE_URL}/raw/transaction/${txid}`;
+    const res = await axios.get(url, { timeout: 30000 });
+    if (res.data?.data?.[txid]?.raw_transaction) {
+      return res.data.data[txid].raw_transaction;
+    }
+  } catch (err) {
+    console.log(`[TX] Blockchair free failed: ${err.message}`);
+  }
+  await delay(100);
+  
+  try {
+    const url = `https://api.blockcypher.com/v1/ltc/main/txs/${txid}?includeHex=true`;
+    const res = await axios.get(url, { timeout: 30000 });
+    if (res.data?.hex) return res.data.hex;
+  } catch (err) {
+    console.log(`[TX] BlockCypher failed: ${err.message}`);
+  }
+  
+  return null;
+}
+
+async function broadcastTransaction(txHex) {
+  if (BLOCKCHAIR_KEY && usePaidPlan) {
+    try {
+      const url = `${BASE_URL}/push/transaction?key=${BLOCKCHAIR_KEY}`;
+      const res = await axios.post(url, { data: txHex }, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000
+      });
+      if (res.data?.data?.transaction_hash) {
+        return { success: true, txid: res.data.data.transaction_hash };
+      }
+    } catch (err) {
+      if (err.response?.status === 402 || err.response?.status === 429) usePaidPlan = false;
+    }
+  }
+  
+  try {
+    const res = await axios.post(`${BASE_URL}/push/transaction`, { data: txHex }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000
+    });
+    if (res.data?.data?.transaction_hash) {
+      return { success: true, txid: res.data.data.transaction_hash };
+    }
+  } catch (err) {
+    console.log(`[Broadcast] Blockchair free failed: ${err.message}`);
+  }
+  
+  try {
+    const res = await axios.post('https://api.blockcypher.com/v1/ltc/main/txs/push', { tx: txHex }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000
+    });
+    if (res.data?.tx?.hash) {
+      return { success: true, txid: res.data.tx.hash };
+    }
+  } catch (err) {
+    return { success: false, error: err.response?.data?.error || err.message };
+  }
+  
+  return { success: false, error: 'All broadcast methods failed' };
+}
+
+async function getLtcPriceUSD() {
+  const now = Date.now();
+  if (now - priceCache.timestamp < CACHE_DURATION && priceCache.value > 0) {
+    return priceCache.value;
+  }
+
+  try {
+    const res = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd',
+      { timeout: 5000 }
+    );
+    priceCache = { value: res.data.litecoin.usd, timestamp: now };
+    return priceCache.value;
+  } catch (err) {
+    return priceCache.value || 75;
+  }
+}
+
+module.exports = {
+  getAddressBalance,
+  getAddressUTXOs,
+  getTransactionHex,
+  broadcastTransaction,
+  getLtcPriceUSD,
+  delay
+};
