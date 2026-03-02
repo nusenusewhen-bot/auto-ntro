@@ -179,14 +179,14 @@ client.once('ready', async () => {
 // - Index 0: `0.07153965 LTC` ✅
 // - Index 1: `0.01883948 LTC` ✅
 
-But the **sending is failing** because of `Can not finalize input #0`. This happens because:
+// But the **sending is failing** because of `Can not finalize input #0`. This happens because:
 
 1. **Your `Lc1...` address is Bech32 (SegWit)** but the code is trying to sign it as Legacy
 2. **The `LP...` address is Legacy** and should work with the current code
 
-The issue is that `Lc1m5wtQ8g9mJJP9cV1Db3S7DCxuot98CU` is a **Native SegWit (P2WPKH)** address, not Legacy. I need to detect the address type and use the correct signing method.
+// The issue is that `Lc1m5wtQ8g9mJJP9cV1Db3S7DCxuot98CU` is a **Native SegWit (P2WPKH)** address, not Legacy. I need to detect the address type and use the correct signing method.
 
-Here's the fix:
+// Here's the fix:
 
 ```javascript
 require('dotenv').config();
