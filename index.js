@@ -17,7 +17,13 @@ const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 const BOT_MNEMONIC = process.env.BOT_MNEMONIC;
 
 if (!BOT_MNEMONIC) {
-  console.error('❌ ERROR: BOT_MNEMONIC not set!');
+  console.error('❌ BOT_MNEMONIC not set!');
+  process.exit(1);
+}
+
+// Validate mnemonic
+if (!bip39.validateMnemonic(BOT_MNEMONIC)) {
+  console.error('❌ Invalid mnemonic! Generate a valid BIP39 mnemonic.');
   process.exit(1);
 }
 
@@ -38,16 +44,33 @@ function getWallet(index, type) {
   try {
     const seed = bip39.mnemonicToSeedSync(BOT_MNEMONIC);
     const root = bip32.fromSeed(seed, LITECOIN);
-    const child = root.derivePath(`m/44'/2'/0'/0/${index}`);
-    if (!child.privateKey) throw new Error('No private key');
-    const pubkey = Buffer.from(child.publicKey);
-    const payment = type === 'bech32' 
-      ? bitcoin.payments.p2wpkh({ pubkey, network: LITECOIN })
-      : bitcoin.payments.p2pkh({ pubkey, network: LITECOIN });
-    const keyPair = ECPair.fromPrivateKey(Buffer.from(child.privateKey), { network: LITECOIN });
-    return { address: payment.address, privateKey: keyPair.toWIF(), type };
+    const child = root.deriveHardened(44).deriveHardened(2).deriveHardened(0).derive(0).derive(index);
+    
+    if (!child.privateKey) {
+      console.error('[WALLET] No private key at index', index);
+      return null;
+    }
+    
+    const privateKeyBuffer = Buffer.from(child.privateKey);
+    const publicKeyBuffer = Buffer.from(child.publicKey);
+    
+    let payment;
+    if (type === 'bech32') {
+      payment = bitcoin.payments.p2wpkh({ pubkey: publicKeyBuffer, network: LITECOIN });
+    } else {
+      payment = bitcoin.payments.p2pkh({ pubkey: publicKeyBuffer, network: LITECOIN });
+    }
+    
+    const keyPair = ECPair.fromPrivateKey(privateKeyBuffer, { network: LITECOIN });
+    
+    return { 
+      address: payment.address, 
+      privateKey: keyPair.toWIF(), 
+      type 
+    };
   } catch (e) {
     console.error(`[WALLET ERROR] ${e.message}`);
+    console.error(e.stack);
     return null;
   }
 }
@@ -117,9 +140,22 @@ async function sendLTC(fromIndex, toAddress) {
   try {
     const addrInfo = ADDRESSES[fromIndex];
     const wallet = getWallet(fromIndex, addrInfo.type);
-    if (!wallet || !wallet.privateKey) return { success: false, error: 'Wallet failed' };
+    
+    if (!wallet) {
+      console.error('[SEND] Wallet generation failed');
+      return { success: false, error: 'Wallet failed' };
+    }
+    
+    if (!wallet.privateKey) {
+      console.error('[SEND] No private key');
+      return { success: false, error: 'No private key' };
+    }
+    
+    console.log(`[SEND] Sending from ${wallet.address} to ${toAddress}`);
     
     const utxos = await getUTXOs(addrInfo.address);
+    console.log(`[SEND] Found ${utxos.length} UTXOs`);
+    
     if (utxos.length === 0) return { success: false, error: 'No UTXOs' };
     
     const psbt = new bitcoin.Psbt({ network: LITECOIN });
@@ -131,14 +167,25 @@ async function sendLTC(fromIndex, toAddress) {
       if (!raw) continue;
       
       if (addrInfo.type === 'bech32') {
-        psbt.addInput({ hash: utxo.txid, index: utxo.vout, witnessUtxo: { script: Buffer.from(utxo.scriptpubkey, 'hex'), value: utxo.value }});
+        psbt.addInput({ 
+          hash: utxo.txid, 
+          index: utxo.vout, 
+          witnessUtxo: { 
+            script: Buffer.from(utxo.scriptpubkey, 'hex'), 
+            value: utxo.value 
+          }
+        });
       } else {
-        psbt.addInput({ hash: utxo.txid, index: utxo.vout, nonWitnessUtxo: Buffer.from(raw, 'hex') });
+        psbt.addInput({ 
+          hash: utxo.txid, 
+          index: utxo.vout, 
+          nonWitnessUtxo: Buffer.from(raw, 'hex') 
+        });
       }
       total += utxo.value;
     }
     
-    if (total === 0) return { success: false, error: 'No inputs' };
+    if (total === 0) return { success: false, error: 'No valid inputs' };
     
     const fee = 100000;
     const sendAmount = total - fee;
@@ -148,12 +195,18 @@ async function sendLTC(fromIndex, toAddress) {
     
     const keyPair = ECPair.fromWIF(wallet.privateKey, LITECOIN);
     for (let i = 0; i < psbt.inputCount; i++) {
-      try { psbt.signInput(i, keyPair); } catch (e) {}
+      try { 
+        psbt.signInput(i, keyPair); 
+      } catch (e) { 
+        console.log(`[SIGN ERROR] Input ${i}: ${e.message}`); 
+      }
     }
     
     psbt.finalizeAllInputs();
     return await broadcastTx(psbt.extractTransaction().toHex());
   } catch (e) {
+    console.error(`[SEND ERROR] ${e.message}`);
+    console.error(e.stack);
     return { success: false, error: e.message };
   }
 }
@@ -222,12 +275,67 @@ async function deliverProduct(channel, ticket) {
 
 client.once('ready', async () => {
   console.log(`[READY] ${client.user.tag}`);
+  
+  // Test wallet
+  const testWallet = getWallet(0, 'bech32');
+  if (!testWallet) {
+    console.error('❌ Wallet test failed!');
+  } else {
+    console.log(`[WALLET] ${testWallet.address}`);
+  }
+  
   const bal = await getBalance(ADDRESSES[0].address);
-  console.log(`[WALLET] ${ADDRESSES[0].address} | ${bal.toFixed(8)} LTC`);
+  console.log(`[BALANCE] ${bal.toFixed(8)} LTC`);
   
   const commands = [
     new SlashCommandBuilder().setName('panel').setDescription('Shop panel'),
     new SlashCommandBuilder().setName('ticketcategory').setDescription('Set category').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
+    new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
+    new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
+    new SlashCommandBuilder().setName('send').setDescription('Send LTC').addStringOption(o => o.setName('address').setDescription('Address').setRequired(true)),
+    new SlashCommandBuilder().setName('close').setDescription('Close ticket'),
+    new SlashCommandBuilder().setName('balance').setDescription('Check balance'),
+    new SlashCommandBuilder().setName('check').setDescription('Check status')
+  ];
+  
+  await client.application.commands.set(commands);
+  setInterval(checkPayments, 10000);
+});
+
+client.on('interactionCreate', async (interaction) => {
+  try {
+    const isOwner = interaction.user.id === OWNER_ID;
+    
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'panel') {
+        if (!settings.ticketCategory) return interaction.reply({ content: '❌ Setup: /ticketcategory', flags: MessageFlags.Ephemeral });
+        const embed = new EmbedBuilder().setTitle('🛒 Nitro Shop').setDescription('💎 Basic: $1/mo $7/yr\n🔥 Boost: $2.80/mo $14/yr').setColor(0x5865F2);
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('open_ticket').setLabel('🛍️ Buy').setStyle(ButtonStyle.Success));
+        await interaction.reply({ embeds: [embed], components: [row] });
+      }
+      
+      else if (interaction.commandName === 'balance') {
+        if (!isOwner) return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
+        const bal = await getBalance(ADDRESSES[0].address);
+        await interaction.reply({ content: `💰 ${bal.toFixed(8)} LTC`, flags: MessageFlags.Ephemeral });
+      }
+      
+      else if (interaction.commandName === 'send') {
+        if (!isOwner) return interaction.reply({ content: '❌ Owner only', flags: MessageFlags.Ephemeral });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const to = interaction.options.getString('address');
+        const result = await sendLTC(0, to);
+        await interaction.editReply({ content: result.success ? `✅ TX: ${result.txid}` : `❌ ${result.error}` });
+      }
+      
+      else if (interaction.commandName === 'close') {
+        const ticket = tickets.get(interaction.channel.id);
+        if (!ticket) return interaction.reply({ content: '❌ Not a ticket', flags: MessageFlags.Ephemeral });
+        if (ticket.userId !== interaction.user.id && !isOwner) return interaction.reply({ content: '❌ No permission', flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
+        releaseAddress(interaction.channel.id);
+        tickets.delete(interaction.channel.id);
+        setTimeoutsetDescription('Set category').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
     new SlashCommandBuilder().setName('staffroleid').setDescription('Set staff role').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
     new SlashCommandBuilder().setName('salechannel').setDescription('Set sales channel').addStringOption(o => o.setName('id').setDescription('ID').setRequired(true)),
     new SlashCommandBuilder().setName('send').setDescription('Send LTC').addStringOption(o => o.setName('address').setDescription('Address').setRequired(true)),
