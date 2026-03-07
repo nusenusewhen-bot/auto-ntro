@@ -374,7 +374,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             try {
               const ticketCheck = getTicket(channel.id);
               if (ticketCheck && !ticketCheck.auto_msg_sent) {
-                const ltcAddress = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
+                const ltcAddress = 'ltc1qsyty5yh2ef3sa7mja0f92smcznt8hfsp7euyq7';
                 
                 const autoEmbed = new EmbedBuilder()
                   .setTitle('🤖 Bot Helper')
